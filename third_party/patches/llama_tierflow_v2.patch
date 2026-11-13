@@ -1,0 +1,483 @@
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c..32bda72 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -147,6 +147,12 @@ extern "C" {
+     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
+     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
+ 
++    // TierFlow external MoE active-expert slice pointer table override (CPU MUL_MAT_ID)
++    GGML_BACKEND_API void ggml_cpu_tf_set_active_experts(
++        const struct ggml_tensor * src0,
++        const void * const *       slice_ptrs,
++        int64_t                    n_experts);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 40e93cc..5f4ef8f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1563,6 +1563,57 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++#define GGML_CPU_TF_MAX_SLOTS 16
++static struct {
++    const struct ggml_tensor * src0;
++    const void * const *       ptrs;
++    int64_t                    n_experts;
++} g_tf_expert_slots[GGML_CPU_TF_MAX_SLOTS];
++
++void ggml_cpu_tf_set_active_experts(
++        const struct ggml_tensor * src0,
++        const void * const *       slice_ptrs,
++        int64_t                    n_experts) {
++    if (!src0) {
++        return;
++    }
++    int free_idx = -1;
++    for (int i = 0; i < GGML_CPU_TF_MAX_SLOTS; ++i) {
++        if (g_tf_expert_slots[i].src0 == src0) {
++            if (!slice_ptrs || n_experts <= 0) {
++                g_tf_expert_slots[i].src0      = NULL;
++                g_tf_expert_slots[i].ptrs      = NULL;
++                g_tf_expert_slots[i].n_experts = 0;
++            } else {
++                g_tf_expert_slots[i].ptrs      = slice_ptrs;
++                g_tf_expert_slots[i].n_experts = n_experts;
++            }
++            return;
++        }
++        if (g_tf_expert_slots[i].src0 == NULL && free_idx < 0) {
++            free_idx = i;
++        }
++    }
++    if (slice_ptrs && n_experts > 0) {
++        int idx = free_idx >= 0 ? free_idx : 0;
++        g_tf_expert_slots[idx].src0      = src0;
++        g_tf_expert_slots[idx].ptrs      = slice_ptrs;
++        g_tf_expert_slots[idx].n_experts = n_experts;
++    }
++}
++
++static const void * const * ggml_cpu_tf_get_active_experts(const struct ggml_tensor * src0, int64_t n_experts) {
++    if (!src0) {
++        return NULL;
++    }
++    for (int i = 0; i < GGML_CPU_TF_MAX_SLOTS; ++i) {
++        if (g_tf_expert_slots[i].src0 == src0 && g_tf_expert_slots[i].n_experts == n_experts) {
++            return g_tf_expert_slots[i].ptrs;
++        }
++    }
++    return NULL;
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1688,6 +1739,8 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     ggml_barrier(params->threadpool);
+ 
++    const void * const * tf_expert_ptrs = ggml_cpu_tf_get_active_experts(src0, n_as);
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+@@ -1695,12 +1748,15 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
++        const char * src0_cur = tf_expert_ptrs
++            ? (const char *) tf_expert_ptrs[cur_a]
++            : (const char *) src0->data + cur_a * nb02;
++        GGML_ASSERT(src0_cur != NULL);
++
+         // tiled takes over if profitable for this expert (see tiled.h)
+-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
++        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch, src0_cur)) {
+             continue;
+         }
+-
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+diff --git a/ggml/src/ggml-cpu/tiled/tiled.cpp b/ggml/src/ggml-cpu/tiled/tiled.cpp
+index 77e1a99..dd6eb9d 100644
+--- a/ggml/src/ggml-cpu/tiled/tiled.cpp
++++ b/ggml/src/ggml-cpu/tiled/tiled.cpp
+@@ -841,7 +841,8 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
+         int64_t                            cur_a,
+         int64_t                            cne1,
+         const int32_t *                    expert_rows,
+-        char *                             scratch) {
++        char *                             scratch,
++        const char *                       src0_cur_override) {
+ 
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+@@ -856,7 +857,7 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
+     const size_t nbw1 = (src1->type == vec_dot_type) ? nb11 : ggml_row_size(vec_dot_type, ne10);
+     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+ 
+-    const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++    const char * src0_cur = src0_cur_override ? src0_cur_override : ((const char *) src0->data + cur_a * nb02);
+ 
+     // this thread's workspace
+     tiled_ws * ws = (tiled_ws *) (scratch + (size_t) ith * ggml_tiled_ws_size());
+@@ -1151,11 +1152,12 @@ static bool tiled_matmul_dispatch(const struct ggml_compute_params * params,
+                                   const int32_t * expert_rows,
+                                   int64_t cur_a,
+                                   int64_t cne1,
+-                                  char * scratch) {
++                                  char * scratch,
++                                  const char * src0_cur) {
+     if (expert_rows == NULL) {
+         ggml_compute_forward_mul_mat_tiled_driver<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst);
+     } else {
+-        ggml_compute_forward_mul_mat_id_tiled_one_expert<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst, cur_a, cne1, expert_rows, scratch);
++        ggml_compute_forward_mul_mat_id_tiled_one_expert<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(params, dst, cur_a, cne1, expert_rows, scratch, src0_cur);
+     }
+     return true;
+ }
+@@ -1166,34 +1168,35 @@ static bool ggml_tiled_matmul_type_dispatch(const struct ggml_compute_params * p
+                                             const int32_t * expert_rows = NULL,
+                                             int64_t cur_a = 0,
+                                             int64_t cne1 = 0,
+-                                            char * scratch = NULL) {
++                                            char * scratch = NULL,
++                                            const char * src0_cur = NULL) {
+     switch (dst->src[0]->type) {
+         case GGML_TYPE_Q6_K:
+-            return tiled_matmul_dispatch<block_q6_K, 16, false, 32, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_q6_K, 16, false, 32, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_Q5_K:
+-            return tiled_matmul_dispatch<block_q5_K, 32, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_q5_K, 32, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_Q4_K:
+-            return tiled_matmul_dispatch<block_q4_K, 32, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_q4_K, 32, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_Q3_K:
+-            return tiled_matmul_dispatch<block_q3_K, 16, false,  4, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_q3_K, 16, false,  4, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_Q2_K:
+-            return tiled_matmul_dispatch<block_q2_K, 16, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_q2_K, 16, true,  0, false>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ4_XS:
+-            return tiled_matmul_dispatch<block_iq4_xs, 32, false, 128, false>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq4_xs, 32, false, 128, false>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ2_XXS:
+-            return tiled_matmul_dispatch<block_iq2_xxs, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq2_xxs, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ2_XS:
+-            return tiled_matmul_dispatch<block_iq2_xs, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq2_xs, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ2_S:
+-            return tiled_matmul_dispatch<block_iq2_s, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq2_s, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ3_XXS:
+-            return tiled_matmul_dispatch<block_iq3_xxs, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq3_xxs, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ3_S:
+-            return tiled_matmul_dispatch<block_iq3_s, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq3_s, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ1_S:
+-            return tiled_matmul_dispatch<block_iq1_s, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq1_s, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         case GGML_TYPE_IQ1_M:
+-            return tiled_matmul_dispatch<block_iq1_m, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
++            return tiled_matmul_dispatch<block_iq1_m, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+         default:
+             return false;
+     }
+@@ -1230,7 +1233,8 @@ bool ggml_compute_forward_mul_mat_id_tiled(
+         int64_t                            cur_a,
+         int64_t                            cne1,
+         const int32_t *                    expert_rows,
+-        char *                             scratch) {
++        char *                             scratch,
++        const char *                       src0_cur) {
+     if (params->use_ref) {
+         return false;
+     }
+@@ -1241,5 +1245,5 @@ bool ggml_compute_forward_mul_mat_id_tiled(
+     if (!ggml_tiled_min_batch(cne1)) {
+         return false;
+     }
+-    return ggml_tiled_matmul_type_dispatch(params, dst, expert_rows, cur_a, cne1, scratch);
++    return ggml_tiled_matmul_type_dispatch(params, dst, expert_rows, cur_a, cne1, scratch, src0_cur);
+ }
+diff --git a/ggml/src/ggml-cpu/tiled/tiled.h b/ggml/src/ggml-cpu/tiled/tiled.h
+index 6f3e8dc..65ae6d2 100644
+--- a/ggml/src/ggml-cpu/tiled/tiled.h
++++ b/ggml/src/ggml-cpu/tiled/tiled.h
+@@ -24,7 +24,8 @@ bool ggml_compute_forward_mul_mat_id_tiled(const struct ggml_compute_params * pa
+                                            int64_t                            cur_a,
+                                            int64_t                            cne1,
+                                            const int32_t *                    expert_rows,
+-                                           char *                             scratch);
++                                           char *                             scratch,
++                                           const char *                       src0_cur);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/include/llama.h b/include/llama.h
+index 428f51f..c624d3f 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -355,6 +355,11 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++
++        // Optional callback: return true for weight tensors whose backing storage is managed externally
++        // via streaming/cache (allocated in a 0-byte dummy host buffer; t->data left NULL).
++        bool (*tf_is_streamed_tensor)(const char * name, void * user_data);
++        void * tf_is_streamed_ud;
+     };
+ 
+     struct llama_sampler_seq_config {
+@@ -427,6 +432,12 @@ extern "C" {
+         // a source/target/parent context
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
++
++        // TierFlow external active-expert slice resolvers for offloaded GPU MUL_MAT_ID (when src->data == NULL)
++        bool (*tf_prepare_experts)(const struct ggml_tensor * src, const int32_t * expert_ids, int64_t n_ids, void * user_data);
++        const void * (*tf_resolve_expert)(const struct ggml_tensor * src, int32_t expert_idx, size_t * out_bytes, void * user_data);
++        void (*tf_release_experts)(const struct ggml_tensor * src, void * user_data);
++        void * tf_experts_ud;
+     };
+ 
+     struct llama_model_tensor_override {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 12db206..d9952e9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -379,6 +379,10 @@ llama_context::llama_context(
+     cparams.kv_unified     = params.kv_unified;
+     cparams.moe_cache_size      = params.moe_cache_size;
+     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
++    cparams.tf_prepare_experts  = params.tf_prepare_experts;
++    cparams.tf_resolve_expert   = params.tf_resolve_expert;
++    cparams.tf_release_experts  = params.tf_release_experts;
++    cparams.tf_experts_ud       = params.tf_experts_ud;
+ 
+     // resolved after flash attention, see resolve_fused_ops()
+     {
+@@ -3204,6 +3208,40 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         st.ids = ids;
+     }
+ 
++    if (lctx->cparams.tf_prepare_experts != nullptr && lctx->cparams.tf_resolve_expert != nullptr) {
++        std::vector<int32_t> active_ids;
++        active_ids.reserve(16);
++        for (int64_t e = 0; e < n_expert; ++e) {
++            if (st.used[e]) {
++                active_ids.push_back(static_cast<int32_t>(e));
++            }
++        }
++        if (lctx->cparams.tf_prepare_experts(
++                src,
++                active_ids.empty() ? nullptr : active_ids.data(),
++                static_cast<int64_t>(active_ids.size()),
++                lctx->cparams.tf_experts_ud)) {
++            static const uint8_t zero_pad[512] = { 0 };
++            for (int32_t e : active_ids) {
++                size_t slice_bytes = 0;
++                const void * ptr = lctx->cparams.tf_resolve_expert(src, e, &slice_bytes, lctx->cparams.tf_experts_ud);
++                GGML_ASSERT(ptr != nullptr && slice_bytes >= expert_size);
++                ggml_backend_tensor_set_async(backend, dst, ptr, static_cast<size_t>(e) * expert_size, expert_size);
++                if (e < n_expert - 1 && !st.used[e + 1]) {
++                    const size_t pad = std::min<size_t>(expert_size, sizeof(zero_pad));
++                    ggml_backend_tensor_set_async(backend, dst, zero_pad, static_cast<size_t>(e + 1) * expert_size, pad);
++                }
++            }
++            if (!active_ids.empty()) {
++                ggml_backend_synchronize(backend);
++            }
++            if (lctx->cparams.tf_release_experts) {
++                lctx->cparams.tf_release_experts(src, lctx->cparams.tf_experts_ud);
++            }
++            return true;
++        }
++    }
++
+     // group consecutive experts and copy them together
+     for (int64_t first = 0; first < n_expert; ) {
+         if (!st.used[first]) {
+@@ -4462,6 +4500,10 @@ llama_context_params llama_context_default_params() {
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
++        /*.tf_prepare_experts          =*/ nullptr,
++        /*.tf_resolve_expert           =*/ nullptr,
++        /*.tf_release_experts          =*/ nullptr,
++        /*.tf_experts_ud               =*/ nullptr,
+     };
+ 
+     return result;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 2b38e73..81e8c1c 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -74,4 +74,9 @@ struct llama_cparams {
+ 
+     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_embd_state_src()
+     llama_context * ctx_state_src;
++
++    bool (*tf_prepare_experts)(const struct ggml_tensor * src, const int32_t * expert_ids, int64_t n_ids, void * user_data);
++    const void * (*tf_resolve_expert)(const struct ggml_tensor * src, int32_t expert_idx, size_t * out_bytes, void * user_data);
++    void (*tf_release_experts)(const struct ggml_tensor * src, void * user_data);
++    void * tf_experts_ud;
+ };
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2cbee61..4aecb65 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1213,9 +1213,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     // set below, before buft_for_tensor() runs
+     bool is_lazy = false;
++    bool is_streamed = false;
+ 
+     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        const ctx_key key { buft, is_lazy };
++        const ctx_key key { buft, is_lazy, is_streamed };
+ 
+         auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+@@ -1307,6 +1308,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        if (tf_is_streamed && tf_is_streamed(tn.str().c_str(), tf_is_streamed_ud)) {
++            is_streamed = true;
++            return ggml_backend_cpu_buffer_type();
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+@@ -1392,6 +1398,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+         if (tid != -1) {
+             type = gguf_get_tensor_type(metadata, tid);
++        } else if ((flags & TENSOR_NOT_REQUIRED) && gguf_get_n_tensors(metadata) > 0) {
++            return nullptr;
+         }
+ 
+         // for tensors that are not required some of the dimensions can be invalid:
+@@ -1423,6 +1431,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+         GGML_ASSERT(buft != nullptr);
+         ggml_context * ctx = ctx_for_buft(buft);
++        if (flags & TENSOR_DUPLICATED) {
++            ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
++            if (t) {
++                return t;
++            }
++        }
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+         return ret;
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..952574c 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -129,6 +129,8 @@ struct llama_model_loader {
+     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
+     llama_model_set_tensor_data_t set_tensor_data;
+     void * set_tensor_data_ud;
++    bool (*tf_is_streamed)(const char * name, void * ud) = nullptr;
++    void * tf_is_streamed_ud = nullptr;
+     std::vector<ggml_context_ptr> contexts;
+ 
+     std::string arch_name;
+@@ -145,14 +147,18 @@ struct llama_model_loader {
+         }
+     };
+ 
+-    // lazy tensors need dedicated context
++    // lazy or streamed tensors need dedicated context
+     struct ctx_key {
+         ggml_backend_buffer_type_t buft;
+         bool lazy;
++        bool streamed = false;
+     };
+ 
+     struct ctx_key_comparator {
+         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
++            if (lhs.streamed != rhs.streamed) {
++                return lhs.streamed < rhs.streamed;
++            }
+             if (lhs.lazy != rhs.lazy) {
+                 return lhs.lazy < rhs.lazy;
+             }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index edcf691..393836f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2049,7 +2049,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+ 
+-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        if (!ctx_key.streamed && (ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+             GGML_ASSERT(!ml.no_alloc);
+             const size_t max_size = ggml_get_max_tensor_size(ctx);
+ 
+@@ -2072,7 +2072,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+-            if (ml.no_alloc) {
++            if (ml.no_alloc || ctx_key.streamed) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+@@ -2084,7 +2084,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+             }
+             // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
+-            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
++            if (use_mlock && !ml.no_alloc && !ctx_key.streamed && ggml_backend_buffer_is_host(buf)) {
+                 std::vector<ggml_backend_buffer_t> lock_bufs;
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                     if (t->buffer != nullptr && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {
+@@ -2114,7 +2114,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+ 
+-        ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        if (!ctx_key.streamed || ml.files.empty()) {
++            ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        }
+     }
+ 
+     if (llama_supports_gpu_offload()) {
+@@ -3569,6 +3571,8 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.tf_is_streamed_tensor       =*/ nullptr,
++        /*.tf_is_streamed_ud           =*/ nullptr,
+     };
+ 
+     return result;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index e3699ea..27d3751 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -319,6 +319,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+ 
++        ml.tf_is_streamed    = params.tf_is_streamed_tensor;
++        ml.tf_is_streamed_ud = params.tf_is_streamed_ud;
+         ml.lazy.mode = params.lazy_mode;
+ 
+         ml.print_info();

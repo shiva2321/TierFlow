@@ -11,7 +11,7 @@ import sys
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LLAMA_DIR = os.path.join(REPO_ROOT, "third_party", "llama.cpp")
-PATCH_FILE = os.path.join(REPO_ROOT, "third_party", "patches", "llama_tierflow_v1.patch")
+PATCH_FILE = os.path.join(REPO_ROOT, "third_party", "patches", "llama_tierflow_v2.patch")
 PINNED_COMMIT = "3ba1ce0e28d991800e1585b7d3533f77213939d6"
 UPSTREAM_URL = "https://github.com/ggml-org/llama.cpp.git"
 

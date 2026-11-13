@@ -72,7 +72,7 @@ else()
 endif()
 
 if(EXISTS "${LLAMA_LIB}")
-    add_executable(tf_runner tf_llama_stream.cpp tf_runner.cpp)
+    add_executable(tf_runner tf_llama_stream.cpp tf_draft.cpp tf_runner.cpp)
     target_include_directories(tf_runner PRIVATE
         "${LLAMA_SRC_DIR}/include"
         "${LLAMA_SRC_DIR}/ggml/include"

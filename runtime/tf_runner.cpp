@@ -156,6 +156,13 @@ int main(int argc, char** argv) {
             else if (v == "fixed4") cfg.spec_k_mode = tierflow::SpecKMode::Fixed4;
             else if (v == "naive_no_union") cfg.spec_k_mode = tierflow::SpecKMode::NaiveNoUnion;
             else return 2;
+        } else if (a == "--draft-model") cfg.draft_gguf_path = need("--draft-model");
+        else if (a == "--spec-max-k") cfg.spec_max_k = std::max(1, std::stoi(need("--spec-max-k")));
+        else if (a == "--spec-tree") {
+            cfg.spec_tree = (std::stoi(need("--spec-tree")) != 0);
+            if (cfg.spec_tree && cfg.spec_max_k <= 4) {
+                cfg.spec_max_k = 8;
+            }
         } else if (a == "--allow-slow-stream") cfg.allow_slow_stream = (std::stoi(need("--allow-slow-stream")) != 0);
         else if (a == "--no-repack") cfg.no_repack = (std::stoi(need("--no-repack")) != 0);
         else if (a == "--use-ioring") cfg.use_ioring = (std::stoi(need("--use-ioring")) != 0);
@@ -306,6 +313,8 @@ int main(int argc, char** argv) {
         js << "\"prefetch_hits\":" << r.prefetch_hits << ",";
         js << "\"prefetch_submitted\":" << r.prefetch_submitted << ",";
         js << "\"prefetch_wasted_bytes\":" << r.prefetch_wasted_bytes << ",";
+        js << "\"eam_prefetch_hits\":" << r.eam_prefetch_hits << ",";
+        js << "\"eam_prefetch_submitted\":" << r.eam_prefetch_submitted << ",";
         js << "\"spec_k_mean\":" << r.spec_k_mean << ",";
         js << "\"spec_accept_rate\":" << r.spec_accept_rate << ",";
         js << "\"prefix_cache_hit\":" << (r.prefix_cache_hit ? "true" : "false") << ",";

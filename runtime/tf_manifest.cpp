@@ -24,7 +24,7 @@ namespace {
 ObjectRole parse_role(const std::string& r) {
     if (r == "always_on") return ObjectRole::ALWAYS_ON;
     if (r == "attn_block") return ObjectRole::ATTN_BLOCK;
-    if (r == "expert" || r == "moe_expert") return ObjectRole::EXPERT;
+    if (r == "expert" || r == "moe_expert" || r == "moe_experts") return ObjectRole::EXPERT;
     if (r == "embedding") return ObjectRole::EMBEDDING;
     if (r == "output_head") return ObjectRole::OUTPUT_HEAD;
     return ObjectRole::UNKNOWN;
@@ -146,6 +146,21 @@ struct JsonCursor {
         val = std::strtod(num.c_str(), nullptr);
         return true;
     }
+
+    bool parse_bool(bool& val) {
+        skip_ws();
+        if (s.compare(pos, 4, "true") == 0) {
+            pos += 4;
+            val = true;
+            return true;
+        }
+        if (s.compare(pos, 5, "false") == 0) {
+            pos += 5;
+            val = false;
+            return true;
+        }
+        return false;
+    }
 };
 
 bool parse_gguf_metadata(JsonCursor& cur, TfManifest& out) {
@@ -166,6 +181,10 @@ bool parse_gguf_metadata(JsonCursor& cur, TfManifest& out) {
             int64_t v = 0; if (!cur.parse_int64(v)) return false; out.head_count = static_cast<int32_t>(v);
         } else if (k.size() >= 24 && k.compare(k.size() - 24, 24, ".attention.head_count_kv") == 0) {
             int64_t v = 0; if (!cur.parse_int64(v)) return false; out.head_count_kv = static_cast<int32_t>(v);
+        } else if (k.size() >= 13 && k.compare(k.size() - 13, 13, ".expert_count") == 0) {
+            int64_t v = 0; if (!cur.parse_int64(v)) return false; out.expert_count = static_cast<int32_t>(v);
+        } else if (k.size() >= 18 && k.compare(k.size() - 18, 18, ".expert_used_count") == 0) {
+            int64_t v = 0; if (!cur.parse_int64(v)) return false; out.expert_used_count = static_cast<int32_t>(v);
         } else {
             if (!cur.skip_value()) return false;
         }
@@ -185,12 +204,16 @@ bool parse_manifest_object(JsonCursor& cur, ManifestObject& obj) {
             uint64_t v = 0; if (!cur.parse_uint64(v)) return false; obj.object_id = static_cast<uint32_t>(v);
         } else if (k == "name") {
             if (!cur.parse_string(obj.name)) return false;
+        } else if (k == "parent_tensor") {
+            if (!cur.parse_string(obj.parent_tensor)) return false;
         } else if (k == "role") {
             std::string r; if (!cur.parse_string(r)) return false; obj.role = parse_role(r);
         } else if (k == "layer") {
             int64_t v = -1; if (!cur.parse_int64(v)) return false; obj.layer = static_cast<int32_t>(v);
         } else if (k == "expert" || k == "expert_idx") {
             int64_t v = -1; if (!cur.parse_int64(v)) return false; obj.expert_idx = static_cast<int32_t>(v);
+        } else if (k == "n_experts") {
+            int64_t v = 0; if (!cur.parse_int64(v)) return false; obj.n_experts = static_cast<int32_t>(v);
         } else if (k == "ggml_type") {
             int64_t v = 0; if (!cur.parse_int64(v)) return false; obj.ggml_type = static_cast<int32_t>(v);
         } else if (k == "ggml_type_name") {
@@ -242,6 +265,8 @@ bool load_tf_manifest(const std::string& json_path, TfManifest& out, std::string
         }
         if (k == "format") {
             if (!cur.parse_string(out.format)) return false;
+        } else if (k == "slice_moe_experts") {
+            if (!cur.parse_bool(out.slice_moe_experts)) return false;
         } else if (k == "source_gguf") {
             if (!cur.parse_string(out.source_gguf)) return false;
         } else if (k == "tfpack_path") {

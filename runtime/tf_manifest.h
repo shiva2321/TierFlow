@@ -18,9 +18,11 @@ enum class ObjectRole : uint8_t {
 struct ManifestObject {
     uint32_t    object_id          = 0;
     std::string name;
+    std::string parent_tensor;
     ObjectRole  role               = ObjectRole::UNKNOWN;
     int32_t     layer              = -1;
     int32_t     expert_idx         = -1;
+    int32_t     n_experts          = 0;
     int32_t     ggml_type          = 0;
     std::string ggml_type_name;
     uint64_t    tfpack_offset      = 0;
@@ -32,6 +34,7 @@ struct ManifestObject {
 
 struct TfManifest {
     std::string                 format;
+    bool                        slice_moe_experts = false;
     std::string                 source_gguf;
     std::string                 tfpack_path;
     uint64_t                    tfpack_size_bytes = 0;
@@ -42,6 +45,8 @@ struct TfManifest {
     int32_t                     ffn_length        = 0;
     int32_t                     head_count        = 0;
     int32_t                     head_count_kv     = 0;
+    int32_t                     expert_count      = 0;
+    int32_t                     expert_used_count = 0;
     std::vector<ManifestObject> objects;
 
     uint64_t total_exact_bytes() const;

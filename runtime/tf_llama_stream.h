@@ -27,6 +27,8 @@ struct llama_vocab;
 
 namespace tierflow {
 
+class tf_draft;
+
 enum class RunMode : uint8_t {
     TierFlow  = 0,
     StockMmap = 1,
@@ -67,6 +69,9 @@ struct StreamEngineConfig {
     bool         no_repack         = false; // match llama.cpp -no-repack in StockMmap/StockDio
     bool         use_ioring        = false; // default IOCP (win32_iocp) or optional IoRing
     SpecKMode    spec_k_mode       = SpecKMode::Off;
+    std::string  draft_gguf_path;
+    int32_t      spec_max_k        = 4;
+    bool         spec_tree         = false;
     std::string  prefix_cache_dir;
     bool         quiet_logs        = true;
 };
@@ -93,6 +98,8 @@ struct StreamPromptResult {
     uint64_t             prefetch_hits             = 0;
     uint64_t             prefetch_submitted        = 0;
     uint64_t             prefetch_wasted_bytes     = 0;
+    uint64_t             eam_prefetch_hits         = 0;
+    uint64_t             eam_prefetch_submitted    = 0;
     double               spec_k_mean               = 0.0;
     double               spec_accept_rate          = 0.0;
     bool                 prefix_cache_hit          = false;
@@ -199,13 +206,39 @@ private:
     static bool tf_is_streamed_cb(const char* name, void* ud);
     static void tf_set_tensor_data_cb(ggml_tensor* tensor, void* ud);
     static bool tf_eval_cb(ggml_tensor* node, bool ask, void* ud);
+    static bool tf_prepare_experts_cb(const ggml_tensor* src, const int32_t* expert_ids, int64_t n_ids, void* ud);
+    static const void* tf_resolve_expert_cb(const ggml_tensor* src, int32_t expert_idx, size_t* out_bytes, void* ud);
+    static void tf_release_experts_cb(const ggml_tensor* src, void* ud);
+
+    enum class MoeProjKind : uint8_t {
+        Gate = 0,
+        Up   = 1,
+        Down = 2,
+    };
+
+    struct MoeParentInfo {
+        uint32_t              parent_idx   = 0;
+        std::string           parent_name;
+        int32_t               layer        = -1;
+        MoeProjKind           kind         = MoeProjKind::Gate;
+        int32_t               n_experts    = 0;
+        int32_t               class_idx    = 1;
+        std::vector<uint32_t> slice_obj_ids;
+    };
 
     bool handle_eval_node(ggml_tensor* node, bool ask);
     uint8_t* slot_ptr(int32_t packed_slot) const;
+    void finish_async_cqe(uint64_t tag, std::chrono::steady_clock::time_point now_tp);
     void poll_completed_async(bool block_one = false);
     int32_t acquire_object_sync(uint32_t obj_id, int32_t order_idx);
+    void submit_prefetch_obj(uint32_t target_obj, bool is_eam);
     void issue_lookahead_prefetch(int32_t current_order_idx);
     void drain_all_async();
+
+    bool prepare_moe_experts(const ggml_tensor* src, const int32_t* expert_ids, int64_t n_ids);
+    const void* resolve_moe_expert(const ggml_tensor* src, int32_t expert_idx, size_t* out_bytes) const;
+    void release_moe_experts(const ggml_tensor* src);
+    void issue_moe_prefetch(int32_t layer, MoeProjKind kind, const std::vector<int32_t>& active_ids);
 
     StreamEngineConfig cfg_;
     StreamInitSummary  summary_;
@@ -254,9 +287,40 @@ private:
     uint64_t                                             run_prefetch_sub_      = 0;
     uint64_t                                             run_prefetch_hits_     = 0;
     uint64_t                                             run_prefetch_wasted_b_ = 0;
+    uint64_t                                             run_eam_prefetch_sub_  = 0;
+    uint64_t                                             run_eam_prefetch_hits_ = 0;
 
-    llama_model*   model_ = nullptr;
-    llama_context* ctx_   = nullptr;
+    // Phase 10 sliced MoE & causal L -> L+1 EAM prefetch state
+    bool                                                 has_streamed_dense_ = false;
+    bool                                                 has_streamed_moe_   = false;
+    int32_t                                              moe_n_layer_        = 0;
+    int32_t                                              moe_n_experts_      = 0;
+    int32_t                                              moe_n_used_         = 0;
+    std::vector<MoeParentInfo>                           moe_parents_;
+    std::unordered_map<std::string, uint32_t>            parent_to_moe_idx_;
+    std::unordered_map<const ggml_tensor*, uint32_t>     tensor_to_moe_parent_;
+    std::vector<std::array<int32_t, 3>>                  moe_layer_parent_; // [layer][kind] -> parent_idx or -1
+
+    // Currently prepared MoE experts for active MUL_MAT_ID (Vulkan or CPU)
+    int32_t                                              active_moe_parent_ = -1;
+    std::vector<const uint8_t*>                          current_moe_slices_;
+    std::vector<int32_t>                                 current_moe_pinned_slots_;
+    std::vector<void*>                                   current_moe_overflow_ptrs_;
+    const ggml_tensor*                                   active_cpu_moe_src_ = nullptr;
+    std::vector<const void*>                             cpu_slice_ptrs_;
+
+    // Causal L -> L+1 Expert Activation Matrix transition predictor
+    std::vector<std::vector<uint16_t>>                   eam_counts_;         // [layer-1][prev*n_exp + cur]
+    std::vector<std::vector<uint32_t>>                   eam_row_totals_;     // [layer-1][prev]
+    std::vector<std::vector<int32_t>>                    prev_layer_experts_; // [layer] active experts
+    std::unordered_set<uint32_t>                         eam_prefetched_unused_objs_;
+    std::unordered_set<uint64_t>                         eam_prefetch_tags_;
+    std::vector<int32_t>                                 last_topk_layer_step_;
+
+    llama_model*                model_ = nullptr;
+    llama_context*              ctx_   = nullptr;
+    std::unique_ptr<tf_draft>   draft_;
+    double                      last_draft_sec_ = 0.0005;
 };
 
 } // namespace tierflow
