@@ -6,6 +6,7 @@
 #include "tf_manifest.h"
 #include "tf_mem_win.h"
 #include "tf_planner.h"
+#include "tf_pool_plan.h"
 #include "tf_prefetch.h"
 #include "tf_probe.h"
 #include "tf_spec.h"
@@ -610,6 +611,60 @@ int main() {
         CHECK(kv_gov.used(tierflow::MemoryTier::RAM) == 0, "KV destructor releases all RAM budget");
         CHECK(kv_gov.used(tierflow::MemoryTier::SSD_SPILL) == 0, "KV destructor releases all SSD spill budget");
         std::filesystem::remove_all(prefix_dir, ec);
+    }
+
+    {
+        std::printf("[TEST] Phase 9 3-size-class arena planner, repin starvation guard, BW EWMA...\n");
+        CHECK(tierflow::assign_size_class(4096) == 0, "4 KiB -> small class 0");
+        CHECK(tierflow::assign_size_class(512ULL << 10) == 0, "512 KiB -> small class 0");
+        CHECK(tierflow::assign_size_class(516ULL << 10) == 1, "516 KiB -> medium class 1");
+        CHECK(tierflow::assign_size_class(4ULL << 20) == 1, "4 MiB -> medium class 1");
+        CHECK(tierflow::assign_size_class((4ULL << 20) + 4096) == 2, ">4 MiB -> large class 2");
+
+        // Verify empty classes allocate 0 slots/bytes, non-empty fit strictly under budget
+        std::vector<uint64_t> sizes{
+            256ULL << 10, 256ULL << 10, 512ULL << 10, 256ULL << 10, // 4 small (stride 512 KiB)
+            3ULL << 20, 3ULL << 20, 4ULL << 20, 3ULL << 20,         // 4 medium (stride 4 MiB)
+        };
+        const uint64_t budget = 64ULL << 20;
+        auto aplan = tierflow::compute_arena_layout(sizes, budget, 16, 4);
+        CHECK(aplan.feasible, "Arena layout feasible within 64 MiB");
+        CHECK(aplan.classes[0].n_slots == 4, "4 small slots match 4 small objects");
+        CHECK(aplan.classes[1].n_slots == 4, "4 medium slots match 4 medium objects");
+        CHECK(aplan.classes[2].n_slots == 0 && aplan.classes[2].total_bytes == 0, "Empty large class allocates 0 bytes");
+        CHECK(aplan.total_bytes <= budget, "Arena total bytes strictly <= budget");
+
+        // Repin tight-slot deadlock guard
+        CHECK(!tierflow::can_repin_slot(8, 0, 2), "Tight 8-slot pool forbids repinning");
+        CHECK(tierflow::can_repin_slot(16, 0, 4), "16-slot pool allows first repin with 11 free slots >= 8");
+        CHECK(!tierflow::can_repin_slot(16, 5, 4), "16-slot pool stops repinning at ratio cap");
+        CHECK(!tierflow::can_repin_slot(16, 4, 8), "16-slot pool stops repinning when remaining < inflight+4");
+
+        // Dynamic prefetch QD & EWMA bandwidth
+        CHECK(tierflow::compute_dynamic_prefetch_cap(2) == 0, "<4 free slots disables prefetch");
+        CHECK(tierflow::compute_dynamic_prefetch_cap(12) == 6, "12 free slots -> QD 6");
+        CHECK(tierflow::compute_dynamic_prefetch_cap(64) == 16, "64 free slots caps QD at 16");
+
+        double bw = tierflow::update_bw_ewma(1.0, 16ULL * 1000 * 1000, 0.004, 0.85); // sample = 4.0 GB/s
+        CHECK(std::abs(bw - 1.45) < 1e-6, "BW EWMA blends 0.85*1.0 + 0.15*4.0 = 1.45 GB/s");
+
+        // Regression test: W-TinyLFU window->probation promotion must never change physical slot bytes
+        tierflow::CacheConfig scfg{};
+        scfg.capacity_slots = 12;
+        scfg.policy = tierflow::CachePolicy::WTinyLFU_SLRU;
+        tierflow::tf_cache scache(scfg);
+        std::vector<uint32_t> slot_contents(12, 0xFFFFFFFFu);
+        for (uint32_t step = 0; step < 300; ++step) {
+            const uint32_t obj = (step < 66) ? (step % 11u) : (step % 19u);
+            auto r = scache.access(obj);
+            CHECK(r.slot_id >= 0 && r.slot_id < 12, "Physical slot bounds valid");
+            if (r.hit) {
+                CHECK(slot_contents[static_cast<size_t>(r.slot_id)] == obj,
+                      "Cache hit returns exact physical slot containing object");
+            } else {
+                slot_contents[static_cast<size_t>(r.slot_id)] = obj;
+            }
+        }
     }
 
     if (g_failures == 0) {

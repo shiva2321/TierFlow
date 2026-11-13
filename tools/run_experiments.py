@@ -180,6 +180,11 @@ def summarize_condition(name: str, rows: List[Dict[str, Any]], plan_line: str, c
         "peak_standby_delta_bytes": max((int(r.get("peak_standby_delta_bytes", 0)) for r in rows), default=0),
         "end_standby_delta_bytes": int(last.get("end_standby_delta_bytes", 0)),
         "ram_governor_total_bytes": int(last.get("ram_governor_total_bytes", 0)),
+        "vram_budget_bytes": int(last.get("vram_budget_bytes", 0)),
+        "vram_governor_total_bytes": int(last.get("vram_governor_total_bytes", 0)),
+        "peak_gpu_used_bytes": max((int(r.get("peak_gpu_used_bytes", 0)) for r in rows), default=0),
+        "n_gpu_layers_active": int(last.get("n_gpu_layers_active", 0)),
+        "io_bw_ewma_gbps": float(last.get("io_bw_ewma_gbps", 0.0)),
         "ssd_stream_bytes": int(last.get("ssd_stream_bytes", 0)),
         "n_cache_slots": int(last.get("n_cache_slots", 0)),
     }
@@ -663,9 +668,75 @@ def run_p8() -> None:
     })
 
 
+# ---------------------------------------------------------------------------
+# Phase 9: Vulkan Hybrid Tiering + 3-Size-Class Arena Pool
+# ---------------------------------------------------------------------------
+def run_p9() -> None:
+    out_dir = os.path.join(REPO_ROOT, "results", "p9_vulkan_pool")
+    base_common = [
+        "--gguf", GGUF_PATH,
+        "--n-ctx", "2048",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "64",
+        "--prompts-file", PROMPTS_20_PATH,
+    ]
+    a_cpu = ["--mode", "stock_mmap", "--n-gpu-layers", "0"] + base_common
+    a_vk = ["--mode", "stock_mmap", "--n-gpu-layers", "99"] + base_common
+    a_hyb9 = ["--mode", "stock_mmap", "--n-gpu-layers", "9"] + base_common
+    a_tf_full = ["--mode", "tierflow", "--manifest", MANIFEST_PATH, "--vram-mb", "2048", "--n-gpu-layers", "99"] + base_common
+    a_tf_split = [
+        "--mode", "tierflow", "--manifest", MANIFEST_PATH,
+        "--vram-mb", "512", "--ram-budget-mb", "512", "--n-gpu-layers", "99",
+        "--allow-slow-stream", "1",
+    ] + base_common
+
+    pl_cpu, r_cpu, dt_cpu = run_tf(a_cpu, os.path.join(out_dir, "stock_mmap_cpu.jsonl"))
+    pl_vk, r_vk, dt_vk = run_tf(a_vk, os.path.join(out_dir, "stock_mmap_vulkan.jsonl"))
+    pl_hyb9, r_hyb9, dt_hyb9 = run_tf(a_hyb9, os.path.join(out_dir, "stock_mmap_hybrid9.jsonl"))
+    pl_full, r_full, dt_full = run_tf(a_tf_full, os.path.join(out_dir, "tierflow_vulkan_full.jsonl"))
+    pl_split, r_split, dt_split = run_tf(a_tf_split, os.path.join(out_dir, "tierflow_hybrid_512_512.jsonl"))
+
+    split_plan = parse_plan_line(pl_split)
+    slot_bank_b = int(split_plan.get("slot_bank", 0))
+    n_slots = int(split_plan.get("cache_slots", 0))
+    max_stride_b = int(r_split[-1].get("slot_stride_bytes", 0)) if r_split else 0
+    if max_stride_b == 0:
+        # Derive largest class stride directly from manifest (ffn_down page-aligned size)
+        with open(MANIFEST_PATH, "r", encoding="utf-8") as mf:
+            man = json.load(mf)
+        max_stride_b = max((int(o["page_aligned_bytes"]) for o in man.get("objects", [])), default=0)
+    uniform_equiv_b = n_slots * max_stride_b
+
+    write_summary(out_dir, {
+        "exp_id": "p9_vulkan_pool",
+        "conditions": {
+            "stock_mmap_cpu": summarize_condition("stock_mmap_cpu", r_cpu, pl_cpu, a_cpu, dt_cpu),
+            "stock_mmap_vulkan": summarize_condition("stock_mmap_vulkan", r_vk, pl_vk, a_vk, dt_vk),
+            "stock_mmap_hybrid9": summarize_condition("stock_mmap_hybrid9", r_hyb9, pl_hyb9, a_hyb9, dt_hyb9),
+            "tierflow_vulkan_full": summarize_condition("tierflow_vulkan_full", r_full, pl_full, a_tf_full, dt_full),
+            "tierflow_hybrid_512_512": summarize_condition("tierflow_hybrid_512_512", r_split, pl_split, a_tf_split, dt_split),
+        },
+        "exactness": {
+            "tierflow_vulkan_full_vs_stock_mmap_vulkan": compare_vs_ref(r_full, r_vk),
+            "tierflow_vulkan_full_vs_stock_mmap_cpu": compare_vs_ref(r_full, r_cpu),
+            "tierflow_hybrid_512_512_vs_stock_mmap_hybrid9": compare_vs_ref(r_split, r_hyb9),
+            "tierflow_hybrid_512_512_vs_stock_mmap_vulkan": compare_vs_ref(r_split, r_vk),
+            "tierflow_hybrid_512_512_vs_stock_mmap_cpu": compare_vs_ref(r_split, r_cpu),
+            "stock_mmap_vulkan_vs_stock_mmap_cpu": compare_vs_ref(r_vk, r_cpu),
+        },
+        "arena_efficiency": {
+            "n_cache_slots": n_slots,
+            "class_arena_slot_bank_bytes": slot_bank_b,
+            "uniform_stride_equiv_bytes": uniform_equiv_b,
+            "memory_reduction_ratio": (uniform_equiv_b / slot_bank_b) if slot_bank_b > 0 else None,
+        },
+    })
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["export-prompts", "selfcheck", "p3", "p4", "p4_v2", "p5", "p6", "p7", "p8"])
+    ap.add_argument("phase", choices=["export-prompts", "selfcheck", "p3", "p4", "p4_v2", "p5", "p6", "p7", "p8", "p9"])
     args = ap.parse_args()
     if args.phase == "export-prompts":
         export_prompts()
@@ -685,6 +756,8 @@ def main() -> None:
         run_p7()
     elif args.phase == "p8":
         run_p8()
+    elif args.phase == "p9":
+        run_p9()
 
 
 if __name__ == "__main__":

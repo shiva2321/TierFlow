@@ -86,9 +86,7 @@ private:
 
     // Finds oldest slot with refcount == 0 in a given list (from front = LRU end).
     int32_t find_unreffed_lru_locked(const std::list<int32_t>& lst) const;
-    void    admit_to_probation_locked(uint32_t cand_obj, int32_t freed_slot_hint,
-                                      bool& did_evict, uint32_t& evicted_obj,
-                                      int32_t& assigned_slot);
+    CacheAccessResult replace_window_victim_locked(int32_t win_victim, uint32_t new_object_id);
 
     CacheConfig                        cfg_;
     mutable std::mutex                 mu_;

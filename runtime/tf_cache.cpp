@@ -191,28 +191,30 @@ bool tf_cache::pin(uint32_t object_id, int32_t* slot_out) {
     return true;
 }
 
-void tf_cache::admit_to_probation_locked(uint32_t cand_obj, int32_t slot_hint,
-                                         bool& did_evict, uint32_t& evicted_obj,
-                                         int32_t& assigned_slot) {
-    // slot_hint is an already-free slot (e.g. from window victim) if >= 0.
-    // Wait: if we simply keep cand_obj in slot_hint vs swapping with probation victim:
-    // Notice we only reach here if Window evicted `cand_obj` (releasing `slot_hint` which held
-    // `cand_obj`, OR `slot_hint == -1` when win_cap == 0).
+CacheAccessResult tf_cache::replace_window_victim_locked(int32_t win_victim, uint32_t new_object_id) {
+    // Physical-slot invariant: any resident object kept in cache MUST keep its existing slot_id
+    // so backing tensor bytes are never orphaned into a different uninitialized slot.
+    CacheAccessResult res{};
+    const uint32_t win_victim_obj = slots_[static_cast<size_t>(win_victim)].object_id;
+
     if (prob_cap_ == 0 && prot_cap_ == 0) {
-        if (slot_hint >= 0) {
-            free_slots_.push_back(slot_hint);
-            slots_[static_cast<size_t>(slot_hint)].list_it = std::prev(free_slots_.end());
-        }
-        assigned_slot = -1;
-        return;
+        res.evicted           = true;
+        res.evicted_object_id = win_victim_obj;
+        detach_from_segment_locked(win_victim);
+        attach_to_segment_locked(win_victim, new_object_id, Segment::WINDOW);
+        res.slot_id = win_victim;
+        return res;
     }
 
     if (probation_lru_.size() + protected_lru_.size() < prob_cap_ + prot_cap_) {
-        int32_t dst = (slot_hint >= 0) ? slot_hint : alloc_free_slot_locked();
-        if (dst >= 0) {
-            attach_to_segment_locked(dst, cand_obj, Segment::PROBATION);
-            assigned_slot = dst;
-            return;
+        int32_t free_s = alloc_free_slot_locked();
+        if (free_s >= 0) {
+            // Keep win_victim_obj in its physical slot (moved logically WINDOW -> PROBATION)
+            detach_from_segment_locked(win_victim);
+            attach_to_segment_locked(win_victim, win_victim_obj, Segment::PROBATION);
+            attach_to_segment_locked(free_s, new_object_id, Segment::WINDOW);
+            res.slot_id = free_s;
+            return res;
         }
     }
 
@@ -228,40 +230,34 @@ void tf_cache::admit_to_probation_locked(uint32_t cand_obj, int32_t slot_hint,
     }
 
     if (prob_victim < 0) {
-        // Every main-cache slot is referenced (refcount > 0); cannot evict!
-        if (slot_hint >= 0) {
-            free_slots_.push_back(slot_hint);
-            slots_[static_cast<size_t>(slot_hint)].list_it = std::prev(free_slots_.end());
-        }
-        assigned_slot = -1;
-        return;
+        // Main cache has no unreferenced victim: reuse win_victim by evicting win_victim_obj
+        res.evicted           = true;
+        res.evicted_object_id = win_victim_obj;
+        detach_from_segment_locked(win_victim);
+        attach_to_segment_locked(win_victim, new_object_id, Segment::WINDOW);
+        res.slot_id = win_victim;
+        return res;
     }
 
     const uint32_t vic_obj = slots_[static_cast<size_t>(prob_victim)].object_id;
-    if (cfg_.policy == CachePolicy::LRU || est_freq_locked(cand_obj) >= est_freq_locked(vic_obj)) {
-        // Admit candidate into probation by evicting prob_victim
-        did_evict   = true;
-        evicted_obj = vic_obj;
+    if (cfg_.policy == CachePolicy::LRU || est_freq_locked(win_victim_obj) >= est_freq_locked(vic_obj)) {
+        // Evict main-cache victim, promote win_victim_obj in-place into PROBATION, load new item in prob_victim
+        res.evicted           = true;
+        res.evicted_object_id = vic_obj;
+        detach_from_segment_locked(win_victim);
+        attach_to_segment_locked(win_victim, win_victim_obj, Segment::PROBATION);
         detach_from_segment_locked(prob_victim);
-        if (slot_hint >= 0) {
-            free_slots_.push_back(prob_victim);
-            slots_[static_cast<size_t>(prob_victim)].list_it = std::prev(free_slots_.end());
-            attach_to_segment_locked(slot_hint, cand_obj, Segment::PROBATION);
-            assigned_slot = slot_hint;
-        } else {
-            attach_to_segment_locked(prob_victim, cand_obj, Segment::PROBATION);
-            assigned_slot = prob_victim;
-        }
+        attach_to_segment_locked(prob_victim, new_object_id, Segment::WINDOW);
+        res.slot_id = prob_victim;
     } else {
-        // Rejected by TinyLFU admission filter: cand_obj leaves cache, vic_obj stays!
-        did_evict   = true;
-        evicted_obj = cand_obj;
-        if (slot_hint >= 0) {
-            free_slots_.push_back(slot_hint);
-            slots_[static_cast<size_t>(slot_hint)].list_it = std::prev(free_slots_.end());
-        }
-        assigned_slot = -1;
+        // Rejected by TinyLFU admission filter: win_victim_obj is evicted and its physical slot reused
+        res.evicted           = true;
+        res.evicted_object_id = win_victim_obj;
+        detach_from_segment_locked(win_victim);
+        attach_to_segment_locked(win_victim, new_object_id, Segment::WINDOW);
+        res.slot_id = win_victim;
     }
+    return res;
 }
 
 CacheAccessResult tf_cache::access(uint32_t object_id) {
@@ -363,16 +359,8 @@ CacheAccessResult tf_cache::access(uint32_t object_id) {
         return res;
     }
 
-    // Remove win_victim from Window and put new item `object_id` directly in Window!
-    const uint32_t win_victim_obj = slots_[static_cast<size_t>(win_victim)].object_id;
-    detach_from_segment_locked(win_victim);
-    attach_to_segment_locked(win_victim, object_id, Segment::WINDOW);
-    res.slot_id = win_victim;
-
-    // Challenge win_victim_obj into Probation via TinyLFU
-    int32_t unused_slot = -1;
-    admit_to_probation_locked(win_victim_obj, -1, res.evicted, res.evicted_object_id, unused_slot);
-    return res;
+    // Promote/evict win_victim without ever changing physical slot of any kept object
+    return replace_window_victim_locked(win_victim, object_id);
 }
 
 CacheAccessResult tf_cache::prefetch(uint32_t object_id) {

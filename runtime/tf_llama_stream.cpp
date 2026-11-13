@@ -1,4 +1,6 @@
 #include "tf_llama_stream.h"
+#include "tf_compute_place.h"
+#include "tf_pool_plan.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -194,9 +196,14 @@ tf_llama_stream::~tf_llama_stream() {
         io_->close();
         io_.reset();
     }
-    if (slot_bank_mem_) {
-        tf_aligned_free(slot_bank_mem_);
-        slot_bank_mem_ = nullptr;
+    for (auto& a : arenas_) {
+        a.cache.reset();
+        if (a.mem) {
+            tf_aligned_free(a.mem);
+            a.mem = nullptr;
+        }
+        a.mem_bytes = 0;
+        a.n_slots = 0;
     }
     if (init_bounce_) {
         tf_aligned_free(init_bounce_);
@@ -206,8 +213,14 @@ tf_llama_stream::~tf_llama_stream() {
     gov_.reset();
 }
 
-uint8_t* tf_llama_stream::slot_ptr(int32_t slot_id) const {
-    return static_cast<uint8_t*>(slot_bank_mem_) + static_cast<size_t>(slot_id) * slot_stride_;
+uint8_t* tf_llama_stream::slot_ptr(int32_t packed_slot) const {
+    if (packed_slot < 0) return nullptr;
+    const int c = slot_class(packed_slot);
+    const int32_t ls = slot_local(packed_slot);
+    if (c < 0 || c >= static_cast<int>(kNumArenaClasses)) return nullptr;
+    const auto& a = arenas_[static_cast<size_t>(c)];
+    if (!a.mem || ls < 0 || static_cast<size_t>(ls) >= a.n_slots) return nullptr;
+    return a.slot_ptr(ls);
 }
 
 bool tf_llama_stream::tf_is_streamed_cb(const char* name, void* ud) {
@@ -226,16 +239,17 @@ void tf_llama_stream::tf_set_tensor_data_cb(ggml_tensor* tensor, void* ud) {
     const uint32_t obj_id = it->second;
     if (self->streamed_names_.count(name) > 0) {
         // Streamed tensor resides in 0-byte dummy buffer; give non-null sentinel pointer inside the
-        // governor-reserved slot bank so ggml_gallocr skips allocation while cb_eval swaps real slots.
-        tensor->data = self->slot_ptr(0);
+        // governor-reserved size-class arena so ggml_gallocr skips allocation while cb_eval swaps real slots.
         auto s_it = self->obj_id_to_sidx_.find(obj_id);
         if (s_it != self->obj_id_to_sidx_.end()) {
+            const int c = self->streamed_objs_[s_it->second].class_idx;
+            tensor->data = self->arenas_[static_cast<size_t>(c)].slot_ptr(0);
             self->streamed_objs_[s_it->second].tensor = tensor;
             self->tensor_to_obj_id_[tensor] = obj_id;
         }
         return;
     }
-    if (!tensor->data) return;
+    if (!tensor->data && (!tensor->buffer || ggml_backend_buffer_is_host(tensor->buffer))) return;
 
     const auto& obj = self->manifest_.objects[obj_id];
     const size_t nbytes = ggml_nbytes(tensor);
@@ -257,31 +271,46 @@ void tf_llama_stream::tf_set_tensor_data_cb(ggml_tensor* tensor, void* ud) {
         throw std::runtime_error("tf_io init submit failed for tensor " + std::string(name));
     }
     tf_read_req done{};
-    while (self->io_->poll(&done, 1) == 0) {
+    while (self->io_->wait(&done, 1, 5) == 0) {
     }
-    std::memcpy(tensor->data, self->init_bounce_, to_copy);
+    if (tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
+        ggml_backend_tensor_set(tensor, self->init_bounce_, 0, to_copy);
+    } else {
+        std::memcpy(tensor->data, self->init_bounce_, to_copy);
+    }
     self->loaded_ram_names_.insert(name);
 }
 
 void tf_llama_stream::poll_completed_async(bool block_one) {
     tf_read_req done[16];
-    int n = io_->poll(done, 16);
+    int n = (block_one && !inflight_by_tag_.empty())
+        ? io_->wait(done, 16, 1)
+        : io_->poll(done, 16);
     while (block_one && n == 0 && !inflight_by_tag_.empty()) {
-        std::this_thread::yield();
-        n = io_->poll(done, 16);
+        n = io_->wait(done, 16, 1);
     }
+    const auto now_tp = Clock::now();
     for (int i = 0; i < n; ++i) {
         auto it = inflight_by_tag_.find(done[i].tag);
         if (it == inflight_by_tag_.end()) continue;
         PendingIo pio = it->second;
         inflight_by_tag_.erase(it);
+        const double dt_s = std::chrono::duration<double>(now_tp - pio.submit_tp).count();
+        io_bw_ewma_gbps_ = update_bw_ewma(io_bw_ewma_gbps_, pio.bytes, dt_s);
         auto oit = inflight_tag_by_obj_.find(pio.object_id);
         if (oit != inflight_tag_by_obj_.end() && oit->second == pio.tag) {
             inflight_tag_by_obj_.erase(oit);
         }
-        if (pio.slot_id >= 0 && static_cast<size_t>(pio.slot_id) < slot_is_prefetch_loading_.size()) {
-            slot_is_prefetch_loading_[pio.slot_id] = 0;
-            cache_->release_slot(pio.slot_id);
+        if (pio.slot_id >= 0) {
+            const int c = slot_class(pio.slot_id);
+            const int32_t ls = slot_local(pio.slot_id);
+            if (c >= 0 && c < static_cast<int>(kNumArenaClasses)) {
+                auto& a = arenas_[static_cast<size_t>(c)];
+                if (ls >= 0 && static_cast<size_t>(ls) < a.prefetch_loading.size()) {
+                    a.prefetch_loading[static_cast<size_t>(ls)] = 0;
+                    a.cache->release_slot(ls);
+                }
+            }
         }
     }
 }
@@ -303,11 +332,14 @@ int32_t tf_llama_stream::acquire_object_sync(uint32_t obj_id, int32_t order_idx)
         }
     }
 
-    auto res = cache_->access(obj_id);
+    const int c = streamed_objs_[obj_id_to_sidx_.at(obj_id)].class_idx;
+    auto& arena = arenas_[static_cast<size_t>(c)];
+
+    auto res = arena.cache->access(obj_id);
     if (res.slot_id < 0) {
         // Fallback: drain async prefetches to free unreferenced Probation slots and retry
         drain_all_async();
-        res = cache_->access(obj_id);
+        res = arena.cache->access(obj_id);
     }
     if (res.slot_id < 0) {
         throw std::runtime_error("tf_cache out of evictable slots during streaming");
@@ -319,8 +351,8 @@ int32_t tf_llama_stream::acquire_object_sync(uint32_t obj_id, int32_t order_idx)
         }
     }
 
-    // If that slot happened to still have a prefetch hold (shouldn't since refcount==0 is required to evict), guard:
-    cache_->acquire_slot(res.slot_id);
+    arena.cache->acquire_slot(res.slot_id);
+    const int32_t packed_slot = pack_slot(c, res.slot_id);
 
     if (res.hit) {
         ++run_hits_;
@@ -331,73 +363,86 @@ int32_t tf_llama_stream::acquire_object_sync(uint32_t obj_id, int32_t order_idx)
         ++run_misses_;
         const auto& obj = manifest_.objects[obj_id];
         const uint64_t tag = next_tag_++;
+        const auto sub_tp = Clock::now();
         tf_read_req req{};
         req.object_id = obj_id;
         req.offset    = obj.tfpack_offset;
         req.size      = obj.page_aligned_bytes;
-        req.dst       = slot_ptr(res.slot_id);
+        req.dst       = arena.slot_ptr(res.slot_id);
         req.priority  = TF_PRIO_DEMAND;
         req.tag       = tag;
         if (!io_->submit(req)) {
-            // Pump completions in case queue was full
             poll_completed_async(true);
             if (!io_->submit(req)) {
-                cache_->release_slot(res.slot_id);
+                arena.cache->release_slot(res.slot_id);
                 throw std::runtime_error("tf_io demand submit failed");
             }
         }
         bool done_flag = false;
         while (!done_flag) {
             tf_read_req done[8];
-            int n = io_->poll(done, 8);
+            int n = io_->wait(done, 8, 1);
+            const auto now_tp = Clock::now();
             for (int i = 0; i < n; ++i) {
                 if (done[i].tag == tag) {
+                    const double dt_s = std::chrono::duration<double>(now_tp - sub_tp).count();
+                    io_bw_ewma_gbps_ = update_bw_ewma(io_bw_ewma_gbps_, obj.page_aligned_bytes, dt_s);
                     done_flag = true;
                 } else {
                     auto it = inflight_by_tag_.find(done[i].tag);
                     if (it != inflight_by_tag_.end()) {
                         PendingIo pio = it->second;
                         inflight_by_tag_.erase(it);
+                        const double dt_s = std::chrono::duration<double>(now_tp - pio.submit_tp).count();
+                        io_bw_ewma_gbps_ = update_bw_ewma(io_bw_ewma_gbps_, pio.bytes, dt_s);
                         auto oit = inflight_tag_by_obj_.find(pio.object_id);
                         if (oit != inflight_tag_by_obj_.end() && oit->second == pio.tag) {
                             inflight_tag_by_obj_.erase(oit);
                         }
-                        if (pio.slot_id >= 0 && static_cast<size_t>(pio.slot_id) < slot_is_prefetch_loading_.size()) {
-                            slot_is_prefetch_loading_[pio.slot_id] = 0;
-                            cache_->release_slot(pio.slot_id);
+                        if (pio.slot_id >= 0) {
+                            const int pc = slot_class(pio.slot_id);
+                            const int32_t pls = slot_local(pio.slot_id);
+                            if (pc >= 0 && pc < static_cast<int>(kNumArenaClasses)) {
+                                auto& pa = arenas_[static_cast<size_t>(pc)];
+                                if (pls >= 0 && static_cast<size_t>(pls) < pa.prefetch_loading.size()) {
+                                    pa.prefetch_loading[static_cast<size_t>(pls)] = 0;
+                                    pa.cache->release_slot(pls);
+                                }
+                            }
                         }
                     }
                 }
             }
-            if (!done_flag) std::this_thread::yield();
         }
         run_bytes_ssd_ += obj.page_aligned_bytes;
     }
 
     (void)order_idx;
-    return res.slot_id;
+    return packed_slot;
 }
 
 void tf_llama_stream::issue_lookahead_prefetch(int32_t current_order_idx) {
-    if (cfg_.prefetch_mode == PrefetchMode::Off || exec_order_.empty() || !cache_ || !io_) return;
-    const size_t n_slots = cache_->capacity();
-    if (n_slots < 3) return;
-    const size_t max_prefetches = std::max<size_t>(1, std::min<size_t>(4, (n_slots - 2) / 2));
-    if (inflight_by_tag_.size() >= max_prefetches) return;
+    if (cfg_.prefetch_mode == PrefetchMode::Off || exec_order_.empty() || !io_) return;
+    if (prefetch_inflight_cap_ == 0 || inflight_by_tag_.size() >= prefetch_inflight_cap_) return;
 
     const int32_t depth = std::max<int32_t>(1, cfg_.lookahead_depth);
     const size_t total = exec_order_.size();
     for (int32_t d = 1; d <= depth; ++d) {
-        if (inflight_by_tag_.size() >= max_prefetches) break;
+        if (inflight_by_tag_.size() >= prefetch_inflight_cap_) break;
         const size_t idx = (static_cast<size_t>(current_order_idx) + static_cast<size_t>(d)) % total;
         uint32_t target_obj = exec_order_[idx];
         if (cfg_.prefetch_mode == PrefetchMode::Shuffled && !shuffled_order_.empty()) {
             target_obj = shuffled_order_[idx % shuffled_order_.size()];
         }
-        if (cache_->is_resident(target_obj) || inflight_tag_by_obj_.count(target_obj) > 0) {
+        auto s_target_it = obj_id_to_sidx_.find(target_obj);
+        if (s_target_it == obj_id_to_sidx_.end()) continue;
+        const int c = streamed_objs_[s_target_it->second].class_idx;
+        auto& arena = arenas_[static_cast<size_t>(c)];
+        if (!arena.cache || arena.n_slots < 3) continue;
+        if (arena.cache->is_resident(target_obj) || inflight_tag_by_obj_.count(target_obj) > 0) {
             continue;
         }
-        auto pres = cache_->prefetch(target_obj);
+        auto pres = arena.cache->prefetch(target_obj);
         if (pres.slot_id < 0) continue;
         if (pres.evicted && prefetched_unused_objs_.erase(pres.evicted_object_id) > 0) {
             auto s_it = obj_id_to_sidx_.find(pres.evicted_object_id);
@@ -405,24 +450,25 @@ void tf_llama_stream::issue_lookahead_prefetch(int32_t current_order_idx) {
                 run_prefetch_wasted_b_ += streamed_objs_[s_it->second].page_aligned_bytes;
             }
         }
-        cache_->acquire_slot(pres.slot_id);
-        slot_is_prefetch_loading_[pres.slot_id] = 1;
+        arena.cache->acquire_slot(pres.slot_id);
+        arena.prefetch_loading[static_cast<size_t>(pres.slot_id)] = 1;
+        const int32_t packed_slot = pack_slot(c, pres.slot_id);
         const auto& obj = manifest_.objects[target_obj];
         const uint64_t tag = next_tag_++;
         tf_read_req req{};
         req.object_id = target_obj;
         req.offset    = obj.tfpack_offset;
         req.size      = obj.page_aligned_bytes;
-        req.dst       = slot_ptr(pres.slot_id);
+        req.dst       = arena.slot_ptr(pres.slot_id);
         req.priority  = TF_PRIO_PREFETCH;
         req.tag       = tag;
         if (!io_->submit(req)) {
-            slot_is_prefetch_loading_[pres.slot_id] = 0;
-            cache_->release_slot(pres.slot_id);
+            arena.prefetch_loading[static_cast<size_t>(pres.slot_id)] = 0;
+            arena.cache->release_slot(pres.slot_id);
             break;
         }
-        PendingIo pio{target_obj, pres.slot_id, tag, true, obj.page_aligned_bytes};
-        inflight_by_tag_[tag]        = pio;
+        PendingIo pio{target_obj, packed_slot, tag, true, obj.page_aligned_bytes, Clock::now()};
+        inflight_by_tag_[tag]            = pio;
         inflight_tag_by_obj_[target_obj] = tag;
         prefetched_unused_objs_.insert(target_obj);
         ++run_prefetch_sub_;
@@ -456,23 +502,26 @@ bool tf_llama_stream::handle_eval_node(ggml_tensor* node, bool ask) {
             }
             last_order_idx = order_idx;
 
-            const int32_t slot_id = acquire_object_sync(obj_id, order_idx);
-            uint8_t* ptr = slot_ptr(slot_id);
+            const int32_t packed_slot = acquire_object_sync(obj_id, order_idx);
+            uint8_t* ptr = slot_ptr(packed_slot);
             base->data = ptr;
             if (src != base) {
                 src->data = ptr + src->view_offs;
             }
-            active_node_slots_.push_back(slot_id);
+            active_node_slots_.push_back(packed_slot);
             auto sit = obj_id_to_sidx_.find(obj_id);
             if (sit != obj_id_to_sidx_.end()) {
                 ++streamed_objs_[sit->second].access_count;
-                if (cfg_.repin_enabled && cache_ &&
-                    repinned_objs_.size() < std::max<size_t>(1, cache_->capacity() / 3) &&
-                    repinned_objs_.count(obj_id) == 0 &&
+                const int c = slot_class(packed_slot);
+                const int32_t ls = slot_local(packed_slot);
+                auto& arena = arenas_[static_cast<size_t>(c)];
+                if (cfg_.repin_enabled && arena.cache &&
+                    can_repin_slot(arena.n_slots, arena.repinned_objs.size(), prefetch_inflight_cap_) &&
+                    arena.repinned_objs.count(obj_id) == 0 &&
                     streamed_objs_[sit->second].access_count >= 2 &&
-                    !slot_is_prefetch_loading_[slot_id]) {
-                    if (cache_->pin(obj_id)) {
-                        repinned_objs_.insert(obj_id);
+                    !arena.prefetch_loading[static_cast<size_t>(ls)]) {
+                    if (arena.cache->pin(obj_id)) {
+                        arena.repinned_objs.insert(obj_id);
                     }
                 }
             }
@@ -484,8 +533,12 @@ bool tf_llama_stream::handle_eval_node(ggml_tensor* node, bool ask) {
         return false;
     } else {
         poll_completed_async(false);
-        for (int32_t s : active_node_slots_) {
-            cache_->release_slot(s);
+        for (int32_t packed : active_node_slots_) {
+            const int c = slot_class(packed);
+            const int32_t ls = slot_local(packed);
+            if (c >= 0 && c < static_cast<int>(kNumArenaClasses) && arenas_[static_cast<size_t>(c)].cache) {
+                arenas_[static_cast<size_t>(c)].cache->release_slot(ls);
+            }
         }
         active_node_slots_.clear();
         return true;
@@ -507,7 +560,7 @@ StreamInitSummary tf_llama_stream::init() {
 
     if (cfg_.mode != RunMode::TierFlow) {
         llama_model_params mparams = llama_model_default_params();
-        mparams.n_gpu_layers       = 0;
+        mparams.n_gpu_layers       = (cfg_.n_gpu_layers >= 0) ? cfg_.n_gpu_layers : 0;
         mparams.load_mode          = (cfg_.mode == RunMode::StockDio) ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_MMAP;
         mparams.use_extra_bufts    = !cfg_.no_repack;
         model_ = llama_model_load_from_file(cfg_.gguf_path.c_str(), mparams);
@@ -575,30 +628,121 @@ StreamInitSummary tf_llama_stream::init() {
         std::ceil(static_cast<double>(n_layer) * 2.0 * n_head_kv * head_dim * cfg_.n_ctx * kv_elem_b));
     const uint64_t compute_reserve = 64ULL << 20; // compute buffers + metadata + runtime headroom
 
+    // 2) Probe Vulkan GPU device & partition hybrid VRAM vs CPU/SSD tiers under tf_governor
+    uint64_t vram_total = 0;
+    uint64_t vram_free  = 0;
+    uint64_t vram_budget = 0;
+    std::string gpu_name;
+    if (cfg_.n_gpu_layers != 0) {
+        ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (gpu_dev) {
+            ggml_backend_dev_props props{};
+            ggml_backend_dev_get_props(gpu_dev, &props);
+            size_t f_b = 0, t_b = 0;
+            ggml_backend_dev_memory(gpu_dev, &f_b, &t_b);
+            vram_free  = static_cast<uint64_t>(f_b);
+            vram_total = static_cast<uint64_t>(t_b);
+            if (props.description && props.description[0]) gpu_name = props.description;
+            else if (props.name && props.name[0]) gpu_name = props.name;
+            const uint64_t usable = (vram_free > cfg_.vram_reserve_bytes)
+                ? (vram_free - cfg_.vram_reserve_bytes) : 0ULL;
+            vram_budget = (cfg_.vram_budget_bytes > 0)
+                ? std::min<uint64_t>(cfg_.vram_budget_bytes, usable)
+                : usable;
+        }
+    }
+
+    std::vector<uint64_t> layer_bytes(static_cast<size_t>(n_layer), 0ULL);
+    uint64_t output_head_bytes = 0;
+    for (const auto& obj : manifest_.objects) {
+        if (obj.layer >= 0 && obj.layer < n_layer) {
+            layer_bytes[static_cast<size_t>(obj.layer)] += obj.exact_bytes;
+        } else if (obj.name == "output.weight" || obj.name == "output_norm.weight") {
+            output_head_bytes += obj.exact_bytes;
+        }
+    }
+
+    int32_t  n_gpu_layers_active = 0;
+    uint64_t vram_weights_bytes  = 0;
+    uint64_t vram_kv_bytes       = 0;
+    uint64_t vram_scratch_bytes  = 0;
+    if (vram_budget > 0 && cfg_.n_gpu_layers != 0) {
+        const int32_t max_layers = (cfg_.n_gpu_layers > 0)
+            ? std::min<int32_t>(cfg_.n_gpu_layers, n_layer + 1)
+            : (n_layer + 1);
+        vram_scratch_bytes = std::min<uint64_t>(std::max<uint64_t>(64ULL << 20, vram_budget / 8), 256ULL << 20);
+        if (vram_budget > output_head_bytes + vram_scratch_bytes) {
+            uint64_t vram_rem = vram_budget - output_head_bytes - vram_scratch_bytes;
+            vram_weights_bytes += output_head_bytes;
+            n_gpu_layers_active = 1; // output layer offloaded
+            if (vram_rem > kv_bytes + (n_layer > 0 ? layer_bytes[static_cast<size_t>(n_layer - 1)] : 0ULL)) {
+                vram_kv_bytes = kv_bytes;
+                vram_rem     -= kv_bytes;
+            }
+            for (int32_t il = n_layer - 1; il >= 0 && n_gpu_layers_active < max_layers; --il) {
+                const uint64_t lb = layer_bytes[static_cast<size_t>(il)];
+                if (lb <= vram_rem) {
+                    vram_rem           -= lb;
+                    vram_weights_bytes += lb;
+                    ++n_gpu_layers_active;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            vram_scratch_bytes = 0;
+        }
+    }
+
+    auto is_on_gpu = [&](const ManifestObject& obj) -> bool {
+        if (n_gpu_layers_active <= 0) return false;
+        if (obj.name == "token_embd.weight") return false; // input layer always CPU in llama.cpp
+        if (obj.layer == -1 && (obj.name == "output.weight" || obj.name == "output_norm.weight")) return true;
+        if (obj.layer >= 0 && obj.layer >= (n_layer + 1 - n_gpu_layers_active)) return true;
+        return false;
+    };
+
+    const uint64_t cpu_kv_bytes = (vram_kv_bytes > 0) ? 0ULL : kv_bytes;
     const uint64_t total_model_exact = manifest_.total_exact_bytes();
-    summary_.model_total_bytes        = total_model_exact;
-    summary_.ram_kv_bytes             = kv_bytes;
+    uint64_t cpu_model_exact = 0;
+    for (const auto& obj : manifest_.objects) {
+        if (!is_on_gpu(obj)) cpu_model_exact += obj.exact_bytes;
+    }
+
+    summary_.model_total_bytes         = total_model_exact;
+    summary_.ram_kv_bytes              = cpu_kv_bytes;
+    summary_.vram_kv_bytes             = vram_kv_bytes;
+    summary_.vram_total_bytes          = vram_total;
+    summary_.vram_free_bytes           = vram_free;
+    summary_.vram_budget_bytes         = vram_budget;
+    summary_.vram_weights_bytes        = vram_weights_bytes;
+    summary_.n_gpu_layers_active       = n_gpu_layers_active;
+    summary_.gpu_name                  = gpu_name;
     summary_.ram_compute_reserve_bytes = compute_reserve;
 
     const uint64_t ram_budget = (cfg_.ram_budget_bytes > 0)
         ? cfg_.ram_budget_bytes
-        : (total_model_exact + kv_bytes + compute_reserve + (128ULL << 20));
-    if (ram_budget <= kv_bytes + compute_reserve) {
+        : (cpu_model_exact + cpu_kv_bytes + compute_reserve + (128ULL << 20));
+    if (ram_budget <= cpu_kv_bytes + compute_reserve) {
         gguf_free(gctx);
-        summary_.error = "RAM budget too small even for KV cache + runtime compute reserve";
+        summary_.error = "RAM budget too small even for CPU KV cache + runtime compute reserve";
         return summary_;
     }
-    const uint64_t avail_for_weights_and_cache = ram_budget - kv_bytes - compute_reserve;
-    const bool needs_streaming = (avail_for_weights_and_cache < total_model_exact);
+    const uint64_t avail_for_weights_and_cache = ram_budget - cpu_kv_bytes - compute_reserve;
+    const bool needs_streaming = (avail_for_weights_and_cache < cpu_model_exact);
 
-    // Prepare planner inputs cleanly
+    // Classify remaining CPU objects & partition 3-size-class arena budget cleanly
     name_to_obj_id_.clear();
     std::vector<PlannerObjectInput> p_inputs;
     p_inputs.reserve(manifest_.objects.size());
-    uint64_t max_stream_aligned = 0;
+    std::vector<uint64_t> streamable_aligned_sizes;
+    uint64_t always_on_bytes = 0;
+    uint64_t first_stream_bytes = 0;
+
     for (const auto& obj : manifest_.objects) {
         name_to_obj_id_[obj.name] = obj.object_id;
-        // Classify FFN matrices (and Attn if needed) as streamable; keep small norms/biases & heads always_on
+        if (is_on_gpu(obj)) continue;
+
         const bool is_ffn_mat  = (obj.name.find(".ffn_gate.weight") != std::string::npos ||
                                   obj.name.find(".ffn_up.weight") != std::string::npos ||
                                   obj.name.find(".ffn_down.weight") != std::string::npos);
@@ -608,51 +752,51 @@ StreamInitSummary tf_llama_stream::init() {
                                   obj.name.find(".attn_output.weight") != std::string::npos);
         const bool streamable = is_ffn_mat || is_attn_mat;
         const bool is_sparse_embd = (obj.name == "token_embd.weight");
-        if (streamable && obj.page_aligned_bytes > max_stream_aligned) {
-            max_stream_aligned = obj.page_aligned_bytes;
+        if (streamable) {
+            streamable_aligned_sizes.push_back(obj.page_aligned_bytes);
+            if (first_stream_bytes == 0) first_stream_bytes = obj.exact_bytes;
+        } else {
+            always_on_bytes += obj.exact_bytes;
         }
-        // True per-token byte traffic multiplier (token_embd is a 1-row lookup; dense weights read 1.0x/tok)
-        // Pinning preference (rank_priority) keeps attention tensors in RAM before FFN tensors.
         const double traffic_freq = is_sparse_embd ? 0.001 : 1.0;
         const double rank_prio    = streamable ? (is_attn_mat ? 1.5 : (1.0 - 1e-4 * std::max(0, obj.layer))) : 2.0;
         p_inputs.push_back({obj.object_id, obj.exact_bytes, traffic_freq, !streamable, rank_prio});
     }
 
-    size_t n_slots = 0;
+    // Consult compute placement heuristic (DDR5 CPU GEMV vs PCIe + GPU) cleanly
+    if (first_stream_bytes > 0) {
+        const auto ct = choose_compute_target(
+            first_stream_bytes, first_stream_bytes * 2ULL, 1u, false, probe_);
+        (void)ct;
+    }
+
+    ArenaLayoutPlan arena_plan{};
     uint64_t slot_bank_bytes = 0;
-    if (needs_streaming) {
-        slot_stride_ = static_cast<size_t>(round_up_4096_sz(max_stream_aligned));
-        // Reserve dynamic slot bank within budget (minimum 4 slots required for safe async prefetch + active op)
-        const uint64_t min_slots = 4;
-        if (avail_for_weights_and_cache < min_slots * slot_stride_) {
+    if (needs_streaming && !streamable_aligned_sizes.empty()) {
+        if (always_on_bytes >= avail_for_weights_and_cache && !cfg_.allow_slow_stream) {
             gguf_free(gctx);
-            summary_.error = "RAM budget too small for minimum 4-slot streaming bank";
-            return summary_;
-        }
-        // Allocate up to cache_slots_max slots, leaving room for pinned always-on weights!
-        uint64_t always_on_bytes = 0;
-        for (const auto& po : p_inputs) {
-            if (po.always_on) always_on_bytes += po.bytes;
-        }
-        if (always_on_bytes + min_slots * slot_stride_ > avail_for_weights_and_cache && !cfg_.allow_slow_stream) {
-            gguf_free(gctx);
-            summary_.error = "Always-on weights + 4 streaming slots exceed RAM budget (enable --allow-slow-stream to proceed)";
+            summary_.error = "Always-on CPU weights exceed RAM budget (enable --allow-slow-stream to proceed)";
             return summary_;
         }
         const uint64_t room_after_always = (avail_for_weights_and_cache > always_on_bytes)
             ? (avail_for_weights_and_cache - always_on_bytes)
-            : (avail_for_weights_and_cache);
-        const size_t affordable_slots = static_cast<size_t>(room_after_always / slot_stride_);
-        n_slots = std::clamp<size_t>(affordable_slots, min_slots, std::max<size_t>(min_slots, cfg_.cache_slots_max));
-        slot_bank_bytes = static_cast<uint64_t>(n_slots) * slot_stride_;
+            : avail_for_weights_and_cache;
+        arena_plan = compute_arena_layout(streamable_aligned_sizes, room_after_always, cfg_.cache_slots_max, 4);
+        if (!arena_plan.feasible) {
+            gguf_free(gctx);
+            summary_.error = "RAM budget too small for minimum 4-slot per-class streaming arenas";
+            return summary_;
+        }
+        slot_bank_bytes = arena_plan.total_bytes;
     }
 
     const uint64_t weight_pin_budget = (avail_for_weights_and_cache > slot_bank_bytes)
         ? (avail_for_weights_and_cache - slot_bank_bytes)
         : 0;
     PlannerBudget p_budget{};
-    p_budget.vram_bytes             = 0;
-    p_budget.ram_bytes              = weight_pin_budget;
+    // Non-GPU objects remaining in p_inputs must never overflow back into VRAM tier
+    p_budget.vram_bytes              = 0ULL;
+    p_budget.ram_bytes               = weight_pin_budget;
     p_budget.allow_slow_dense_stream = cfg_.allow_slow_stream;
     plan_ = build_placement_plan(p_inputs, p_budget, probe_);
     if (!plan_.feasible) {
@@ -661,14 +805,17 @@ StreamInitSummary tf_llama_stream::init() {
         return summary_;
     }
 
-    // Governor startup budget check & atomic reservations
-    gov_ = std::make_unique<tf_governor>(ram_budget, 0, ram_budget * 2);
+    // Governor startup budget check & atomic reservations across RAM + VRAM
+    gov_ = std::make_unique<tf_governor>(ram_budget, vram_budget, ram_budget * 2);
     std::vector<PlanReservation> startup_reqs{
         {MemoryTier::RAM, plan_.ram_used_bytes, "ram_weights"},
         {MemoryTier::RAM, slot_bank_bytes, "tf_cache_slots"},
-        {MemoryTier::RAM, kv_bytes, "kv_cache"},
+        {MemoryTier::RAM, cpu_kv_bytes, "kv_cache"},
         {MemoryTier::RAM, compute_reserve, "compute_scratch"},
     };
+    if (vram_weights_bytes > 0)  startup_reqs.push_back({MemoryTier::VRAM, vram_weights_bytes, "vram_weights"});
+    if (vram_kv_bytes > 0)       startup_reqs.push_back({MemoryTier::VRAM, vram_kv_bytes, "vram_kv_cache"});
+    if (vram_scratch_bytes > 0)  startup_reqs.push_back({MemoryTier::VRAM, vram_scratch_bytes, "vram_compute_scratch"});
     std::string gov_reason;
     if (!gov_->check_plan(startup_reqs, &gov_reason)) {
         gguf_free(gctx);
@@ -683,12 +830,19 @@ StreamInitSummary tf_llama_stream::init() {
         }
     }
 
+    // Map dense index over p_inputs -> manifest_.objects[] safely!
+    std::unordered_map<uint32_t, PlacementTier> tier_by_obj;
+    for (size_t i = 0; i < p_inputs.size(); ++i) {
+        tier_by_obj[p_inputs[i].object_id] = plan_.tier_of[i];
+    }
+
     streamed_names_.clear();
     streamed_objs_.clear();
     obj_id_to_sidx_.clear();
-    for (size_t i = 0; i < manifest_.objects.size(); ++i) {
-        if (plan_.tier_of[i] == PlacementTier::SSD_STREAM) {
-            const auto& obj = manifest_.objects[i];
+    shuffled_order_.clear();
+    for (const auto& obj : manifest_.objects) {
+        auto tit = tier_by_obj.find(obj.object_id);
+        if (tit != tier_by_obj.end() && tit->second == PlacementTier::SSD_STREAM) {
             streamed_names_.insert(obj.name);
             StreamedTensorInfo info{};
             info.object_id          = obj.object_id;
@@ -697,6 +851,7 @@ StreamInitSummary tf_llama_stream::init() {
             info.exact_bytes        = obj.exact_bytes;
             info.page_aligned_bytes = obj.page_aligned_bytes;
             info.layer              = obj.layer;
+            info.class_idx          = assign_size_class(obj.page_aligned_bytes);
             obj_id_to_sidx_[obj.object_id] = streamed_objs_.size();
             streamed_objs_.push_back(info);
             shuffled_order_.push_back(obj.object_id);
@@ -705,26 +860,40 @@ StreamInitSummary tf_llama_stream::init() {
     std::mt19937_64 shuf_gen(20261112ULL);
     std::shuffle(shuffled_order_.begin(), shuffled_order_.end(), shuf_gen);
 
-    // Burst prediction refinement alongside sustained planner prediction
     HardwareProfile burst_probe = probe_;
     burst_probe.bw_ssd_sustained_gbps = probe_.bw_ssd_burst_gbps;
     const double burst_cost = evaluate_placement_cost_sec(p_inputs, plan_.tier_of, burst_probe);
 
-    summary_.ram_weights_bytes       = plan_.ram_used_bytes;
-    summary_.ram_slot_bank_bytes     = slot_bank_bytes;
-    summary_.ram_governor_total_bytes = gov_->used(MemoryTier::RAM);
-    summary_.ssd_stream_bytes        = plan_.ssd_stream_bytes;
-    summary_.n_streamed_tensors      = streamed_objs_.size();
-    summary_.n_cache_slots           = n_slots;
-    summary_.slot_stride_bytes       = slot_stride_;
-    summary_.predicted_hit_rate      = plan_.predicted_hit_rate;
-    summary_.predicted_tok_s         = plan_.predicted_tok_s;
-    summary_.predicted_tok_s_burst   = (burst_cost > 0.0) ? (1.0 / burst_cost) : 0.0;
+    size_t max_arena_stride = 0;
+    for (size_t c = 0; c < kNumArenaClasses; ++c) {
+        summary_.arena_slots[c]   = arena_plan.classes[c].n_slots;
+        summary_.arena_strides[c] = arena_plan.classes[c].stride_bytes;
+        if (arena_plan.classes[c].stride_bytes > max_arena_stride) {
+            max_arena_stride = arena_plan.classes[c].stride_bytes;
+        }
+    }
 
-    // Open .tfpack via unbuffered async I/O
+    io_bw_ewma_gbps_                  = probe_.bw_ssd_sustained_gbps;
+    summary_.ram_weights_bytes        = plan_.ram_used_bytes;
+    summary_.ram_slot_bank_bytes      = slot_bank_bytes;
+    summary_.ram_governor_total_bytes = gov_->used(MemoryTier::RAM);
+    summary_.vram_governor_total_bytes = gov_->used(MemoryTier::VRAM);
+    summary_.ssd_stream_bytes         = plan_.ssd_stream_bytes;
+    summary_.n_streamed_tensors       = streamed_objs_.size();
+    summary_.n_cache_slots            = arena_plan.total_slots;
+    summary_.slot_stride_bytes        = max_arena_stride;
+    summary_.predicted_hit_rate       = plan_.predicted_hit_rate;
+    summary_.predicted_tok_s          = plan_.predicted_tok_s;
+    summary_.predicted_tok_s_burst    = (burst_cost > 0.0) ? (1.0 / burst_cost) : 0.0;
+    summary_.io_bw_ewma_gbps          = io_bw_ewma_gbps_;
+
+    prefetch_inflight_cap_ = compute_dynamic_prefetch_cap(arena_plan.total_slots);
+    if (prefetch_inflight_cap_ == 0) prefetch_inflight_cap_ = 1;
+
+    // Open .tfpack via unbuffered async I/O with dynamic queue depth
     tf_io_options io_opts{};
-    io_opts.max_inflight          = 32;
-    io_opts.prefetch_inflight_cap = 4;
+    io_opts.max_inflight          = std::max<size_t>(32, prefetch_inflight_cap_ * 2);
+    io_opts.prefetch_inflight_cap = prefetch_inflight_cap_;
     io_opts.strict_priority       = true;
     io_opts.align_bytes           = 4096;
     if (cfg_.use_ioring && tf_ioring_is_supported(nullptr)) {
@@ -738,25 +907,30 @@ StreamInitSummary tf_llama_stream::init() {
         return summary_;
     }
 
-    if (n_slots > 0) {
-        slot_bank_bytes_ = static_cast<size_t>(slot_bank_bytes);
-        slot_bank_mem_   = tf_aligned_alloc(slot_bank_bytes_, 4096);
-        if (!slot_bank_mem_) {
+    for (size_t c = 0; c < kNumArenaClasses; ++c) {
+        const auto& sp = arena_plan.classes[c];
+        if (sp.n_slots == 0 || sp.stride_bytes == 0) continue;
+        auto& arena = arenas_[c];
+        arena.stride_bytes = sp.stride_bytes;
+        arena.n_slots      = sp.n_slots;
+        arena.mem_bytes    = static_cast<size_t>(sp.total_bytes);
+        arena.mem          = tf_aligned_alloc(arena.mem_bytes, 4096);
+        if (!arena.mem) {
             gguf_free(gctx);
-            summary_.error = "Failed to VirtualAlloc aligned slot bank";
+            summary_.error = "Failed to VirtualAlloc aligned size-class arena";
             return summary_;
         }
-        slot_is_prefetch_loading_.assign(n_slots, 0);
+        arena.prefetch_loading.assign(sp.n_slots, 0);
         CacheConfig ccfg{};
-        ccfg.capacity_slots = n_slots;
+        ccfg.capacity_slots = sp.n_slots;
         ccfg.policy         = cfg_.cache_policy;
-        cache_              = std::make_unique<tf_cache>(ccfg);
+        arena.cache         = std::make_unique<tf_cache>(ccfg);
     }
 
     // Construct llama_model using zero-mmap user callback loader + 0-byte streamed tensor dummy buffers
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers       = 0;
-    mparams.use_extra_bufts    = false;
+    mparams.n_gpu_layers       = n_gpu_layers_active;
+    mparams.use_extra_bufts    = (n_gpu_layers_active > 0);
     mparams.tf_is_streamed_tensor = &tf_llama_stream::tf_is_streamed_cb;
     mparams.tf_is_streamed_ud     = this;
 
@@ -803,7 +977,11 @@ StreamInitSummary tf_llama_stream::init() {
         ? GGML_TYPE_F16
         : (cfg_.kv_precision == KvPrecision::Q8_K_Q4_V ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0);
     cparams.flash_attn_type      = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.offload_kqv          = (vram_kv_bytes > 0);
     if (!streamed_names_.empty()) {
+        // Dense CPU-streamed weights must run on CPU so cb_eval acquires slots before compute;
+        // otherwise ggml_backend_sched op_offload copies NULL base->data for batches >= 32.
+        cparams.op_offload        = false;
         cparams.cb_eval           = &tf_llama_stream::tf_eval_cb;
         cparams.cb_eval_user_data = this;
     }
@@ -1083,7 +1261,8 @@ StreamPromptResult tf_llama_stream::run_prompt(const std::string& prompt,
                 sin.c_always_sec = ram_gb / std::max(1.0, probe_.cpu_gemv_effective_gbps);
                 if (summary_.ssd_stream_bytes > 0 && summary_.n_streamed_tensors > 0) {
                     const double mean_obj_gb = (static_cast<double>(summary_.ssd_stream_bytes) / n_stream_f) / 1e9;
-                    sin.cost_per_expert_sec  = mean_obj_gb / std::max(0.1, probe_.bw_ssd_sustained_gbps);
+                    const double eff_bw = (io_bw_ewma_gbps_ > 0.05) ? io_bw_ewma_gbps_ : probe_.bw_ssd_sustained_gbps;
+                    sin.cost_per_expert_sec  = mean_obj_gb / std::max(0.1, eff_bw);
                 } else {
                     sin.cost_per_expert_sec  = 0.0002;
                 }
@@ -1252,6 +1431,7 @@ StreamPromptResult tf_llama_stream::run_prompt(const std::string& prompt,
     out.spec_accept_rate         = (spec_draft_total > 0)
         ? static_cast<double>(spec_accept_total) / static_cast<double>(spec_draft_total)
         : 0.0;
+    out.io_bw_ewma_gbps          = io_bw_ewma_gbps_;
     out.ok = true;
     return out;
 }

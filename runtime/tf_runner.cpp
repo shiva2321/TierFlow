@@ -124,6 +124,9 @@ int main(int argc, char** argv) {
         } else if (a == "--gguf") cfg.gguf_path = need("--gguf");
         else if (a == "--manifest") cfg.manifest_path = need("--manifest");
         else if (a == "--ram-budget-mb") cfg.ram_budget_bytes = std::stoull(need("--ram-budget-mb")) << 20;
+        else if (a == "--vram-mb") cfg.vram_budget_bytes = std::stoull(need("--vram-mb")) << 20;
+        else if (a == "--vram-reserve-mib") cfg.vram_reserve_bytes = std::stoull(need("--vram-reserve-mib")) << 20;
+        else if (a == "--n-gpu-layers") cfg.n_gpu_layers = std::stoi(need("--n-gpu-layers"));
         else if (a == "--n-ctx") cfg.n_ctx = static_cast<uint32_t>(std::stoul(need("--n-ctx")));
         else if (a == "--n-batch") cfg.n_batch = static_cast<uint32_t>(std::stoul(need("--n-batch")));
         else if (a == "--n-threads") cfg.n_threads = std::stoi(need("--n-threads"));
@@ -235,12 +238,20 @@ int main(int argc, char** argv) {
 
     std::printf(
         "PLAN model_bytes=%llu ram_weights=%llu slot_bank=%llu kv_reserve=%llu ssd_stream=%llu "
+        "vram_budget=%llu vram_weights=%llu vram_kv=%llu gpu_layers=%d arenas=[%zu,%zu,%zu] "
         "streamed_objs=%zu cache_slots=%zu pred_hit=%.4f pred_tok_s=%.3f pred_tok_s_burst=%.3f load_ms=%.2f\n",
         static_cast<unsigned long long>(init_res.model_total_bytes),
         static_cast<unsigned long long>(init_res.ram_weights_bytes),
         static_cast<unsigned long long>(init_res.ram_slot_bank_bytes),
         static_cast<unsigned long long>(init_res.ram_kv_bytes),
         static_cast<unsigned long long>(init_res.ssd_stream_bytes),
+        static_cast<unsigned long long>(init_res.vram_budget_bytes),
+        static_cast<unsigned long long>(init_res.vram_weights_bytes),
+        static_cast<unsigned long long>(init_res.vram_kv_bytes),
+        init_res.n_gpu_layers_active,
+        init_res.arena_slots[0],
+        init_res.arena_slots[1],
+        init_res.arena_slots[2],
         init_res.n_streamed_tensors,
         init_res.n_cache_slots,
         init_res.predicted_hit_rate,
@@ -308,6 +319,10 @@ int main(int argc, char** argv) {
         js << "\"peak_gpu_used_bytes\":" << std::max(max_gpu.load(), snap_now.gpu_used_bytes) << ",";
         js << "\"pdh_disk_read_bytes_total\":" << static_cast<uint64_t>(pdh_disk_read_bytes_accum.load()) << ",";
         js << "\"ram_governor_total_bytes\":" << init_res.ram_governor_total_bytes << ",";
+        js << "\"vram_budget_bytes\":" << init_res.vram_budget_bytes << ",";
+        js << "\"vram_governor_total_bytes\":" << init_res.vram_governor_total_bytes << ",";
+        js << "\"n_gpu_layers_active\":" << init_res.n_gpu_layers_active << ",";
+        js << "\"io_bw_ewma_gbps\":" << r.io_bw_ewma_gbps << ",";
         js << "\"ssd_stream_bytes\":" << init_res.ssd_stream_bytes << ",";
         js << "\"n_cache_slots\":" << init_res.n_cache_slots << ",";
         js << "\"generated_tokens\":[";

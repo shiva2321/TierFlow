@@ -124,6 +124,35 @@ public:
         return count;
     }
 
+    int wait(tf_read_req* done, int max, uint32_t timeout_ms) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (fd_ < 0 || max <= 0 || !done) return 0;
+        drain_cqes_locked();
+        dispatch_locked();
+#if defined(TF_HAS_LIBURING)
+        if (ready_done_.empty() && (stats_.inflight_demand > 0 || stats_.inflight_prefetch > 0) && timeout_ms > 0) {
+            struct __kernel_timespec ts{};
+            ts.tv_sec  = static_cast<__kernel_time64_t>(timeout_ms / 1000u);
+            ts.tv_nsec = static_cast<long long>(timeout_ms % 1000u) * 1000000LL;
+            struct io_uring_cqe* cqe = nullptr;
+            if (io_uring_wait_cqe_timeout(&ring_, &cqe, &ts) == 0 && cqe) {
+                handle_cqe_locked(cqe);
+                io_uring_cqe_seen(&ring_, cqe);
+                drain_cqes_locked();
+                dispatch_locked();
+            }
+        }
+#else
+        (void)timeout_ms;
+#endif
+        int count = 0;
+        while (count < max && !ready_done_.empty()) {
+            done[count++] = ready_done_.front();
+            ready_done_.pop_front();
+        }
+        return count;
+    }
+
     bool cancel(uint64_t tag) override {
         std::lock_guard<std::mutex> lock(mu_);
         for (auto it = prefetch_q_.begin(); it != prefetch_q_.end(); ++it) {

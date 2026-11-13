@@ -197,6 +197,28 @@ public:
         return count;
     }
 
+    int wait(tf_read_req* done, int max, uint32_t timeout_ms) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (hfile_ == INVALID_HANDLE_VALUE || !ring_ || max <= 0 || !done) return 0;
+
+        drain_cqes_locked();
+        dispatch_locked();
+        if (ready_done_.empty() && (stats_.inflight_demand > 0 || stats_.inflight_prefetch > 0) && timeout_ms > 0) {
+            const auto& api = IoRingApi::instance();
+            UINT32 sub = 0;
+            api.submit(ring_, 1, timeout_ms, &sub);
+            drain_cqes_locked();
+            dispatch_locked();
+        }
+
+        int count = 0;
+        while (count < max && !ready_done_.empty()) {
+            done[count++] = ready_done_.front();
+            ready_done_.pop_front();
+        }
+        return count;
+    }
+
     bool cancel(uint64_t tag) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (hfile_ == INVALID_HANDLE_VALUE || !ring_) return false;
