@@ -1,0 +1,108 @@
+{
+  "exp_id": "p0_hw_probe",
+  "timestamp_utc": "2026-11-12T14:48:09.646041+00:00",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python_version": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+  "torch_version": "2.6.0+cu124",
+  "cuda_device": "NVIDIA GeForce RTX 3060",
+  "nvme_seq_4mib_unbuffered": {
+    "mode": "unbuffered_direct_io",
+    "block_size_bytes": 4194304,
+    "num_reads": 64,
+    "bytes_read_total": 268435456,
+    "elapsed_sec": 0.04675940000015544,
+    "bandwidth_gbps": 5.740780591690819,
+    "delta_system_cache_bytes": 0,
+    "delta_proc_private_bytes": 372736
+  },
+  "nvme_rand_1mib_unbuffered": {
+    "mode": "unbuffered_direct_io",
+    "block_size_bytes": 1048576,
+    "num_reads": 256,
+    "bytes_read_total": 268435456,
+    "elapsed_sec": 0.06613589999869873,
+    "bandwidth_gbps": 4.058846345256988,
+    "delta_system_cache_bytes": 0,
+    "delta_proc_private_bytes": 16384
+  },
+  "nvme_seq_4mib_buffered_control": {
+    "mode": "os_buffered_io",
+    "block_size_bytes": 4194304,
+    "num_reads": 64,
+    "bytes_read_total": 268435456,
+    "elapsed_sec": 0.06093429999964428,
+    "bandwidth_gbps": 4.405325998683288,
+    "delta_system_cache_bytes": 255750144,
+    "delta_proc_private_bytes": 8429568
+  },
+  "memory_and_compute": {
+    "ram_copy_traffic_gbps": {
+      "mean": 33.352205619614594,
+      "min": 32.484867729862074,
+      "max": 34.25123046902664,
+      "n": 20
+    },
+    "ram_read_gbps": {
+      "mean": 49.482976727808676,
+      "min": 48.57417366722788,
+      "max": 51.53696884510252,
+      "n": 20
+    },
+    "pcie_h2d_pinned_gbps": {
+      "mean": 26.607500216334774,
+      "min": 26.426014576773756,
+      "max": 26.696182670718567,
+      "n": 20
+    },
+    "pcie_h2d_pageable_gbps": {
+      "mean": 18.698295346747617,
+      "min": 17.38166334962418,
+      "max": 19.274186912752356,
+      "n": 20
+    },
+    "vram_copy_traffic_gbps": {
+      "mean": 329.3121149506659,
+      "min": 318.63666205448965,
+      "max": 339.57679433893594,
+      "n": 20
+    },
+    "moe_expert_crossover_qwen3_dims_fp16": {
+      "batch_1": {
+        "cpu_inplace_ms_mean": 0.19886499994754558,
+        "pcie_transfer_plus_gpu_ms_mean": 10.68225999997594,
+        "gpu_resident_ms_mean": 0.08370500008823001,
+        "cpu_beats_pcie_transfer": true
+      },
+      "batch_2": {
+        "cpu_inplace_ms_mean": 0.30812500008323696,
+        "pcie_transfer_plus_gpu_ms_mean": 0.5552499997975247,
+        "gpu_resident_ms_mean": 0.13694999979634304,
+        "cpu_beats_pcie_transfer": true
+      },
+      "batch_4": {
+        "cpu_inplace_ms_mean": 0.5810650001876638,
+        "pcie_transfer_plus_gpu_ms_mean": 0.44592999993255944,
+        "gpu_resident_ms_mean": 0.10203500005445676,
+        "cpu_beats_pcie_transfer": false
+      },
+      "batch_8": {
+        "cpu_inplace_ms_mean": 0.9228949998941971,
+        "pcie_transfer_plus_gpu_ms_mean": 0.45088500000929344,
+        "gpu_resident_ms_mean": 0.100544999804697,
+        "cpu_beats_pcie_transfer": false
+      },
+      "batch_16": {
+        "cpu_inplace_ms_mean": 1.8489250000129687,
+        "pcie_transfer_plus_gpu_ms_mean": 0.4451449999578472,
+        "gpu_resident_ms_mean": 0.08572999995521968,
+        "cpu_beats_pcie_transfer": false
+      },
+      "batch_32": {
+        "cpu_inplace_ms_mean": 3.943880000315403,
+        "pcie_transfer_plus_gpu_ms_mean": 0.7950700000037614,
+        "gpu_resident_ms_mean": 0.10391499981778907,
+        "cpu_beats_pcie_transfer": false
+      }
+    }
+  }
+}

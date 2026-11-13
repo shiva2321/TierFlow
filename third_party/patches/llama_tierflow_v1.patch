@@ -1,0 +1,163 @@
+diff --git a/include/llama.h b/include/llama.h
+index 428f51f..11eaaf3 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -355,6 +355,11 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++
++        // Optional callback: return true for weight tensors whose backing storage is managed externally
++        // via streaming/cache (allocated in a 0-byte dummy host buffer; t->data left NULL).
++        bool (*tf_is_streamed_tensor)(const char * name, void * user_data);
++        void * tf_is_streamed_ud;
+     };
+ 
+     struct llama_sampler_seq_config {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2cbee61..4aecb65 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1213,9 +1213,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     // set below, before buft_for_tensor() runs
+     bool is_lazy = false;
++    bool is_streamed = false;
+ 
+     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        const ctx_key key { buft, is_lazy };
++        const ctx_key key { buft, is_lazy, is_streamed };
+ 
+         auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+@@ -1307,6 +1308,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             return lazy_read::buft();
+         }
+ 
++        if (tf_is_streamed && tf_is_streamed(tn.str().c_str(), tf_is_streamed_ud)) {
++            is_streamed = true;
++            return ggml_backend_cpu_buffer_type();
++        }
++
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+@@ -1392,6 +1398,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+         if (tid != -1) {
+             type = gguf_get_tensor_type(metadata, tid);
++        } else if ((flags & TENSOR_NOT_REQUIRED) && gguf_get_n_tensors(metadata) > 0) {
++            return nullptr;
+         }
+ 
+         // for tensors that are not required some of the dimensions can be invalid:
+@@ -1423,6 +1431,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+         GGML_ASSERT(buft != nullptr);
+         ggml_context * ctx = ctx_for_buft(buft);
++        if (flags & TENSOR_DUPLICATED) {
++            ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
++            if (t) {
++                return t;
++            }
++        }
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+         return ret;
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..952574c 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -129,6 +129,8 @@ struct llama_model_loader {
+     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
+     llama_model_set_tensor_data_t set_tensor_data;
+     void * set_tensor_data_ud;
++    bool (*tf_is_streamed)(const char * name, void * ud) = nullptr;
++    void * tf_is_streamed_ud = nullptr;
+     std::vector<ggml_context_ptr> contexts;
+ 
+     std::string arch_name;
+@@ -145,14 +147,18 @@ struct llama_model_loader {
+         }
+     };
+ 
+-    // lazy tensors need dedicated context
++    // lazy or streamed tensors need dedicated context
+     struct ctx_key {
+         ggml_backend_buffer_type_t buft;
+         bool lazy;
++        bool streamed = false;
+     };
+ 
+     struct ctx_key_comparator {
+         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
++            if (lhs.streamed != rhs.streamed) {
++                return lhs.streamed < rhs.streamed;
++            }
+             if (lhs.lazy != rhs.lazy) {
+                 return lhs.lazy < rhs.lazy;
+             }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index edcf691..393836f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2049,7 +2049,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+ 
+-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        if (!ctx_key.streamed && (ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+             GGML_ASSERT(!ml.no_alloc);
+             const size_t max_size = ggml_get_max_tensor_size(ctx);
+ 
+@@ -2072,7 +2072,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+-            if (ml.no_alloc) {
++            if (ml.no_alloc || ctx_key.streamed) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+@@ -2084,7 +2084,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+             }
+             // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
+-            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
++            if (use_mlock && !ml.no_alloc && !ctx_key.streamed && ggml_backend_buffer_is_host(buf)) {
+                 std::vector<ggml_backend_buffer_t> lock_bufs;
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                     if (t->buffer != nullptr && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {
+@@ -2114,7 +2114,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+ 
+-        ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        if (!ctx_key.streamed || ml.files.empty()) {
++            ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
++        }
+     }
+ 
+     if (llama_supports_gpu_offload()) {
+@@ -3569,6 +3571,8 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.tf_is_streamed_tensor       =*/ nullptr,
++        /*.tf_is_streamed_ud           =*/ nullptr,
+     };
+ 
+     return result;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index e3699ea..27d3751 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -319,6 +319,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+ 
++        ml.tf_is_streamed    = params.tf_is_streamed_tensor;
++        ml.tf_is_streamed_ud = params.tf_is_streamed_ud;
+         ml.lazy.mode = params.lazy_mode;
+ 
+         ml.print_info();

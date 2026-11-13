@@ -1,0 +1,40 @@
+{
+  "exp_id": "p2_io_win",
+  "shard_bytes": 2147483648,
+  "reps": 20,
+  "ioring_supported": true,
+  "ioring_info": "IoRing supported (MaxVersion=400, MaxSQ=65536, MaxCQ=131072)",
+  "raw_win32_seq_4m_qd32_gbps": {"n": 20, "mean": 4.6914, "sd": 0.4795, "ci95": 0.2244, "min": 4.2726, "p50": 4.6918, "p95": 4.8874, "max": 6.4701},
+  "tf_iocp_seq_4m_qd32_gbps": {"n": 20, "mean": 6.9068, "sd": 0.4918, "ci95": 0.2302, "min": 6.3467, "p50": 7.3373, "p95": 7.3418, "max": 7.3424},
+  "tf_iocp_seq_pct_of_raw": 147.22,
+  "tf_iocp_rand_1m_qd1_gbps": {"n": 20, "mean": 4.0324, "sd": 0.4965, "ci95": 0.2323, "min": 3.4909, "p50": 3.9061, "p95": 4.7296, "max": 4.7426},
+  "tf_iocp_rand_1m_qd8_gbps": {"n": 20, "mean": 7.2989, "sd": 0.0213, "ci95": 0.0100, "min": 7.2519, "p50": 7.2937, "p95": 7.3283, "max": 7.3308},
+  "tf_iocp_rand_1m_qd32_gbps": {"n": 20, "mean": 7.3179, "sd": 0.0224, "ci95": 0.0105, "min": 7.2525, "p50": 7.3223, "p95": 7.3427, "max": 7.3457},
+  "tf_ioring_seq_4m_qd32_gbps": {"n": 20, "mean": 7.3143, "sd": 0.0493, "ci95": 0.0231, "min": 7.1500, "p50": 7.3308, "p95": 7.3348, "max": 7.3371},
+  "tf_ioring_seq_pct_of_raw": 155.91,
+  "tf_ioring_rand_1m_qd32_gbps": {"n": 20, "mean": 7.3051, "sd": 0.0545, "ci95": 0.0255, "min": 7.1441, "p50": 7.3186, "p95": 7.3429, "max": 7.3483},
+  "buffered_os_control": {
+    "read_bytes": 536870912,
+    "gbps": 4.9016,
+    "delta_system_cache_bytes": 536870912,
+    "delta_standby_normal_bytes": 532938752
+  },
+  "demand_latency_under_storm_ms": {
+    "strict_priority": {"n": 20, "mean": 1.2406, "sd": 0.0285, "ci95": 0.0133, "min": 1.1975, "p50": 1.2522, "p95": 1.2806, "max": 1.2834},
+    "fifo_null_control": {"n": 20, "mean": 16.7270, "sd": 0.5367, "ci95": 0.2512, "min": 15.9361, "p50": 16.7186, "p95": 17.6277, "max": 17.6471}
+  },
+  "sustained_read_60s": {
+    "duration_sec": 60.015,
+    "total_bytes_read": 159230459904,
+    "mean_gbps": 2.6532,
+    "pdh_physical_disk_mean_gbps": 2.6879,
+    "pdh_est_total_bytes": 161317988642,
+    "peak_delta_system_cache_bytes": 2144907264,
+    "end_delta_system_cache_bytes": 1572704256,
+    "peak_delta_standby_normal_bytes": 2156888064,
+    "peak_delta_system_used_bytes": 944029696,
+    "peak_process_private_bytes": 59555840,
+    "mem_samples": 548,
+    "io_errors": 0
+  }
+}

@@ -1,0 +1,36 @@
+# Build artifacts & compiled binaries
+runtime/build/
+third_party/llama.cpp/
+build/
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.so
+*.dylib
+*.a
+
+# Packed binary models, raw GGUFs & unbuffered I/O scratch shards
+packed_models/
+models/
+*.tfpack
+*.gguf
+results/**/*.bin
+results/**/*.dat
+results/**/io_shard*
+results/**/kv_spill*
+
+# Large / external imported documentation dumps
+Frontier Model Memory Optimization.md
+
+# Python / OS / IDE caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.vs/
+Thumbs.db
+.DS_Store

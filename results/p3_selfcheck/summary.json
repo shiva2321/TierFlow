@@ -1,0 +1,117 @@
+{
+  "exp_id": "p3_selfcheck",
+  "stock_mmap_repack_a_vs_b": {
+    "exact_token_matches": 20,
+    "total_prompts": 20,
+    "proportion": 1.0,
+    "wilson_ci95": [
+      0.8388748398148705,
+      1.0
+    ],
+    "top1_first_token_agree": 20,
+    "first_divergence_indices": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "max_shared_top16_logit_diff": 0.0,
+    "mean_shared_top16_logit_diff": 0.0
+  },
+  "stock_mmap_norepack_a_vs_b": {
+    "exact_token_matches": 20,
+    "total_prompts": 20,
+    "proportion": 1.0,
+    "wilson_ci95": [
+      0.8388748398148705,
+      1.0
+    ],
+    "top1_first_token_agree": 20,
+    "first_divergence_indices": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "max_shared_top16_logit_diff": 0.0,
+    "mean_shared_top16_logit_diff": 0.0
+  },
+  "stock_mmap_norepack_vs_repack": {
+    "exact_token_matches": 8,
+    "total_prompts": 20,
+    "proportion": 0.4,
+    "wilson_ci95": [
+      0.2188065312717802,
+      0.6134185007652458
+    ],
+    "top1_first_token_agree": 18,
+    "first_divergence_indices": [
+      57,
+      17,
+      0,
+      29,
+      32,
+      11,
+      36,
+      48,
+      0,
+      null,
+      null,
+      null,
+      39,
+      13,
+      39,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "max_shared_top16_logit_diff": 0.6507000000000005,
+    "mean_shared_top16_logit_diff": 0.3800250000000003
+  },
+  "elapsed_sec": {
+    "repack_a": 41.62817979999818,
+    "repack_b": 34.06781029999911,
+    "norepack_a": 34.09421189999921,
+    "norepack_b": 34.181586899998365
+  },
+  "timestamp_utc": "2026-11-12T16:21:23.113260+00:00",
+  "git": {
+    "repo_has_commit": true,
+    "llama_cpp_commit": "3ba1ce0e28d991800e1585b7d3533f77213939d6",
+    "llama_cpp_dirty": true
+  }
+}
