@@ -15,6 +15,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace tierflow {
@@ -205,6 +209,11 @@ tf_kv_store::~tf_kv_store() {
         CloseHandle(static_cast<HANDLE>(spill_handle_));
         spill_handle_ = nullptr;
     }
+#else
+    if (spill_fd_ >= 0) {
+        ::close(spill_fd_);
+        spill_fd_ = -1;
+    }
 #endif
 }
 
@@ -229,7 +238,20 @@ bool tf_kv_store::ensure_spill_open_locked() {
     spill_handle_ = h;
     return true;
 #else
-    return false;
+    if (spill_fd_ >= 0) return true;
+    std::error_code ec;
+    auto parent = std::filesystem::path(cfg_.spill_path).parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+    int fd = ::open(cfg_.spill_path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT, 0600);
+    if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
+        fd = ::open(cfg_.spill_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    }
+    if (fd < 0) {
+        return false;
+    }
+    ::unlink(cfg_.spill_path.c_str());
+    spill_fd_ = fd;
+    return true;
 #endif
 }
 
@@ -262,8 +284,23 @@ bool tf_kv_store::write_ssd_slot_locked(uint64_t slot, const void* src_aligned) 
     stats_.spill_bytes_written += aligned_bytes_;
     return true;
 #else
-    (void)slot; (void)src_aligned;
-    return false;
+    const uint8_t* p = static_cast<const uint8_t*>(src_aligned);
+    off_t off = static_cast<off_t>(slot * aligned_bytes_);
+    size_t rem = aligned_bytes_;
+    while (rem > 0) {
+        ssize_t w = ::pwrite(spill_fd_, p, rem, off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (w == 0) return false;
+        p += w;
+        off += w;
+        rem -= static_cast<size_t>(w);
+    }
+    ++stats_.spill_writes;
+    stats_.spill_bytes_written += aligned_bytes_;
+    return true;
 #endif
 }
 
@@ -287,8 +324,23 @@ bool tf_kv_store::read_ssd_slot_locked(uint64_t slot, void* dst_aligned) {
     stats_.spill_bytes_read += aligned_bytes_;
     return true;
 #else
-    (void)slot; (void)dst_aligned;
-    return false;
+    uint8_t* p = static_cast<uint8_t*>(dst_aligned);
+    off_t off = static_cast<off_t>(slot * aligned_bytes_);
+    size_t rem = aligned_bytes_;
+    while (rem > 0) {
+        ssize_t r = ::pread(spill_fd_, p, rem, off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;
+        p += r;
+        off += r;
+        rem -= static_cast<size_t>(r);
+    }
+    ++stats_.spill_reads;
+    stats_.spill_bytes_read += aligned_bytes_;
+    return true;
 #endif
 }
 

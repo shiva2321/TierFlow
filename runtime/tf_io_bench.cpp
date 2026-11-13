@@ -3,6 +3,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -562,6 +566,7 @@ int main(int argc, char** argv) {
     uint64_t    shard_bytes = 2ULL << 30; // 2 GiB real non-zero test file
     double      sustained_s = 60.0;
     bool        keep_file   = false;
+    bool        heat_soak_only = false;
     int         reps        = 20;
 
     for (int i = 1; i < argc; ++i) {
@@ -572,9 +577,29 @@ int main(int argc, char** argv) {
         else if (a == "--seconds" && i + 1 < argc) sustained_s = std::atof(argv[++i]);
         else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
         else if (a == "--keep-file") keep_file = true;
+        else if (a == "--heat-soak-only") heat_soak_only = true;
     }
 
     std::filesystem::create_directories(std::filesystem::path(out_json).parent_path());
+
+    if (heat_soak_only) {
+        if (!std::filesystem::exists(shard_path)) {
+            std::fprintf(stderr, "Heat-soak target missing: %s\n", shard_path.c_str());
+            return 2;
+        }
+        const uint64_t fsz = std::filesystem::file_size(shard_path);
+        tierflow::tf_mem_sampler mem;
+        std::printf("[SOAK] Running %.0fs read-only unbuffered NVMe heat-soak on %s (%.2f GiB)...\n",
+                    sustained_s, shard_path.c_str(), static_cast<double>(fsz) / (1024.0 * 1024.0 * 1024.0));
+        auto sust = run_sustained_60s(shard_path, fsz, sustained_s, 0ULL, mem);
+        std::printf("[SOAK] Done %.2fs: read=%.2f GB (%.3f GB/s), peak_delta_sys_cache=%.2f MiB, io_errors=%llu\n",
+                    sust.duration_sec,
+                    static_cast<double>(sust.total_bytes_read) / 1e9,
+                    sust.mean_gbps,
+                    static_cast<double>(sust.peak_delta_sys_cache) / (1024.0 * 1024.0),
+                    static_cast<unsigned long long>(sust.io_errors));
+        return (sust.io_errors == 0) ? 0 : 1;
+    }
 
     if (!std::filesystem::exists(shard_path) || std::filesystem::file_size(shard_path) != shard_bytes) {
         if (!create_unbuffered_shard(shard_path, shard_bytes)) return 1;
@@ -717,7 +742,116 @@ int main(int argc, char** argv) {
     std::printf("[DONE] Wrote %s\n", out_json.c_str());
     return 0;
 #else
-    std::fprintf(stderr, "Windows benchmark only\n");
-    return 1;
+    std::string shard_path  = "/var/tmp/.tmp_tf_io_linux.bin";
+    uint64_t    shard_bytes = 512ULL << 20;
+    int         reps        = 10;
+    bool        keep_file   = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--file" && i + 1 < argc) shard_path = argv[++i];
+        else if (a == "--size-mb" && i + 1 < argc) shard_bytes = static_cast<uint64_t>(std::atoll(argv[++i])) << 20;
+        else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
+        else if (a == "--keep-file") keep_file = true;
+    }
+
+    auto read_meminfo_cache_bytes = []() -> int64_t {
+        std::ifstream f("/proc/meminfo");
+        std::string line;
+        int64_t total_kb = 0;
+        while (std::getline(f, line)) {
+            long long val = 0;
+            if (std::sscanf(line.c_str(), "Cached: %lld kB", &val) == 1 ||
+                std::sscanf(line.c_str(), "Buffers: %lld kB", &val) == 1) {
+                total_kb += static_cast<int64_t>(val);
+            }
+        }
+        return total_kb * 1024LL;
+    };
+
+    bool created_temp = false;
+    if (!std::filesystem::exists(shard_path)) {
+        created_temp = true;
+        int fd = ::open(shard_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0600);
+        if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) {
+            fd = ::open(shard_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        }
+        if (fd < 0) {
+            std::fprintf(stderr, "Failed to create Linux benchmark file %s (errno=%d)\n", shard_path.c_str(), errno);
+            return 1;
+        }
+        constexpr uint64_t kChunk = 4ULL << 20;
+        void* buf = tierflow::tf_aligned_alloc(kChunk, 4096);
+        auto* p = static_cast<uint8_t*>(buf);
+        for (uint64_t i = 0; i < kChunk; i += 4096) p[i] = static_cast<uint8_t>((i >> 12) ^ 0x5Au);
+        for (uint64_t off = 0; off < shard_bytes; off += kChunk) {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(kChunk, shard_bytes - off));
+            if (::write(fd, buf, n) != static_cast<ssize_t>(n)) {
+                tierflow::tf_aligned_free(buf);
+                ::close(fd);
+                std::filesystem::remove(shard_path);
+                return 1;
+            }
+        }
+        ::fsync(fd);
+        ::close(fd);
+        tierflow::tf_aligned_free(buf);
+    }
+
+    const uint64_t fsz = std::filesystem::file_size(shard_path);
+    std::string reason;
+    const bool has_uring = tierflow::tf_ioring_is_supported(&reason);
+    std::printf("[INFO] Linux io_uring supported=%s (%s), file=%s (%.2f MiB)\n",
+                has_uring ? "true" : "false", reason.c_str(), shard_path.c_str(),
+                static_cast<double>(fsz) / (1024.0 * 1024.0));
+
+    auto bench_work = [&](size_t chunk_bytes, size_t qd, uint64_t total_bytes, bool random_off, int64_t* out_cache_delta) {
+        std::vector<double> gbps_runs;
+        auto io = tierflow::tf_io_create_ioring({32, 8, true, 4096});
+        if (!io || !io->open(shard_path.c_str())) return compute_stats(gbps_runs);
+        std::vector<void*> bufs(qd, nullptr);
+        for (size_t i = 0; i < qd; ++i) bufs[i] = tierflow::tf_aligned_alloc(chunk_bytes, 4096);
+        const uint64_t blocks = std::max<uint64_t>(1, (fsz - chunk_bytes) / chunk_bytes);
+        const uint64_t num_reads = std::max<uint64_t>(1, total_bytes / chunk_bytes);
+        std::mt19937_64 rng(42);
+        const int64_t cache0 = read_meminfo_cache_bytes();
+        for (int rep = 0; rep < reps; ++rep) {
+            uint64_t submitted = 0, completed = 0, tag = 1;
+            auto submit_one = [&](size_t slot) {
+                uint64_t blk = random_off ? (rng() % blocks) : (submitted % blocks);
+                io->submit({0, blk * chunk_bytes, chunk_bytes, bufs[slot], tierflow::TF_PRIO_DEMAND, tag++});
+                ++submitted;
+            };
+            auto t0 = Clock::now();
+            for (size_t s = 0; s < qd && submitted < num_reads; ++s) submit_one(s);
+            tierflow::tf_read_req done[16];
+            while (completed < submitted) {
+                int n = io->wait(done, 16, 100);
+                for (int i = 0; i < n; ++i) {
+                    ++completed;
+                    if (submitted < num_reads) submit_one(static_cast<size_t>((done[i].tag - 1) % qd));
+                }
+            }
+            double dt = std::chrono::duration<double>(Clock::now() - t0).count();
+            if (dt > 0.0) gbps_runs.push_back((static_cast<double>(num_reads * chunk_bytes) / 1e9) / dt);
+        }
+        if (out_cache_delta) *out_cache_delta = read_meminfo_cache_bytes() - cache0;
+        for (void* b : bufs) tierflow::tf_aligned_free(b);
+        io->close();
+        return compute_stats(gbps_runs);
+    };
+
+    int64_t cache_delta_seq = 0, cache_delta_rnd = 0;
+    auto seq_st = bench_work(4ULL << 20, 32, 256ULL << 20, false, &cache_delta_seq);
+    auto rnd_st = bench_work(1ULL << 20, 32, 128ULL << 20, true, &cache_delta_rnd);
+    std::printf("[BENCH] Linux seq 4MiB QD=32: %.3f +/- %.3f GB/s (min=%.3f max=%.3f, pagecache_delta=%lld B)\n",
+                seq_st.mean, seq_st.ci95, seq_st.min, seq_st.max, static_cast<long long>(cache_delta_seq));
+    std::printf("[BENCH] Linux rand 1MiB QD=32: %.3f +/- %.3f GB/s (min=%.3f max=%.3f, pagecache_delta=%lld B)\n",
+                rnd_st.mean, rnd_st.ci95, rnd_st.min, rnd_st.max, static_cast<long long>(cache_delta_rnd));
+
+    if (created_temp && !keep_file) {
+        std::error_code ec;
+        std::filesystem::remove(shard_path, ec);
+    }
+    return 0;
 #endif
 }

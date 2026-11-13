@@ -16,11 +16,14 @@ HardwareProfile run_tf_probe(const std::string& optional_nvme_probe_file,
                              int ssd_qd_hint) {
     HardwareProfile prof{};
 
-    // Multi-threaded barrier-synchronized DDR5 read & GEMV probe (excludes thread-spawn latency)
-    constexpr size_t kBytes = 128ULL << 20;
+    // Multi-threaded barrier-synchronized DDR5 read & quantized GEMV probe (excludes thread-spawn latency)
+    constexpr size_t kBytes = 256ULL << 20; // > desktop L3 caches (incl. X3D 96-128 MiB) to hit DRAM
     const size_t n_floats   = kBytes / sizeof(float);
     std::vector<float> src(n_floats, 1.0001f);
     std::vector<float> dst(n_floats, 0.0f);
+    for (size_t i = 0; i < n_floats; i += 1024) {
+        src[i] = 1.0f + static_cast<float>(i & 255u) * 0.001f;
+    }
     std::memcpy(dst.data(), src.data(), kBytes);
 
     unsigned int hw = std::thread::hardware_concurrency();
@@ -30,8 +33,8 @@ HardwareProfile run_tf_probe(const std::string& optional_nvme_probe_file,
         : std::min<unsigned int>(hw, 8u);
     n_threads = std::clamp<unsigned int>(n_threads, 1u, 16u);
 
-    double best_copy = 0.0;
-    for (int it = 0; it < 4; ++it) {
+    std::vector<double> copy_samples;
+    for (int it = 0; it < 5; ++it) {
         std::barrier sync_pt(static_cast<std::ptrdiff_t>(n_threads + 1));
         std::vector<std::thread> workers;
         workers.reserve(n_threads);
@@ -52,13 +55,12 @@ HardwareProfile run_tf_probe(const std::string& optional_nvme_probe_file,
         double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (auto& w : workers) w.join();
         if (dt > 0.0) {
-            double gbps = (static_cast<double>(kBytes) / 1e9) / dt;
-            if (gbps > best_copy) best_copy = gbps;
+            copy_samples.push_back((static_cast<double>(kBytes) / 1e9) / dt);
         }
     }
 
     std::atomic<double> total_sink{0.0};
-    double best_read = 0.0;
+    std::vector<double> read_samples;
     for (int it = 0; it < 5; ++it) {
         std::barrier sync_pt(static_cast<std::ptrdiff_t>(n_threads + 1));
         std::vector<std::thread> workers;
@@ -93,15 +95,68 @@ HardwareProfile run_tf_probe(const std::string& optional_nvme_probe_file,
         double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (auto& w : workers) w.join();
         if (dt > 0.0) {
-            double gbps = (static_cast<double>(kBytes) / 1e9) / dt;
-            if (gbps > best_read) best_read = gbps;
+            read_samples.push_back((static_cast<double>(kBytes) / 1e9) / dt);
         }
     }
 
-    if (best_copy > 1.0) prof.bw_ram_copy_gbps = best_copy;
-    if (best_read > 1.0) {
-        prof.bw_ram_read_gbps        = best_read;
-        prof.cpu_gemv_effective_gbps = best_read * 0.90;
+    // Measure DRAM-bound FMA GEMV throughput over 256 MiB (exceeds L3 caches), scaled by
+    // quantized Q4 dequant-unpack overhead (~0.75 of FP32 DRAM streaming rate in llama.cpp AVX2).
+    const float w0 = 0.125f, w1 = -0.250f, w2 = 0.375f, w3 = -0.500f;
+    const float w4 = 0.625f, w5 = -0.750f, w6 = 0.875f, w7 = -0.999f;
+    std::vector<double> gemv_samples;
+    for (int it = 0; it < 5; ++it) {
+        std::barrier sync_pt(static_cast<std::ptrdiff_t>(n_threads + 1));
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        const size_t chunk = n_floats / n_threads;
+        for (unsigned int t = 0; t < n_threads; ++t) {
+            const size_t beg = static_cast<size_t>(t) * chunk;
+            const size_t end = (t + 1 == n_threads) ? n_floats : (beg + chunk);
+            workers.emplace_back([&, beg, end]() {
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+                sync_pt.arrive_and_wait();
+                for (size_t i = beg; i + 7 < end; i += 8) {
+                    s0 += src[i + 0] * w0;
+                    s1 += src[i + 1] * w1;
+                    s2 += src[i + 2] * w2;
+                    s3 += src[i + 3] * w3;
+                    s4 += src[i + 4] * w4;
+                    s5 += src[i + 5] * w5;
+                    s6 += src[i + 6] * w6;
+                    s7 += src[i + 7] * w7;
+                }
+                sync_pt.arrive_and_wait();
+                double prev = total_sink.load(std::memory_order_relaxed);
+                total_sink.store(prev + static_cast<double>((s0 + s1 + s2 + s3) + (s4 + s5 + s6 + s7)),
+                                 std::memory_order_relaxed);
+            });
+        }
+        sync_pt.arrive_and_wait();
+        auto t0 = std::chrono::steady_clock::now();
+        sync_pt.arrive_and_wait();
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        for (auto& w : workers) w.join();
+        if (dt > 0.0) {
+            gemv_samples.push_back(((static_cast<double>(kBytes) / 1e9) / dt) * 0.75);
+        }
+    }
+
+    auto median_of = [](std::vector<double>& v) -> double {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double med_copy = median_of(copy_samples);
+    const double med_read = median_of(read_samples);
+    const double med_gemv = median_of(gemv_samples);
+
+    if (med_copy > 1.0) prof.bw_ram_copy_gbps = med_copy;
+    if (med_read > 1.0) prof.bw_ram_read_gbps = med_read;
+    if (med_gemv > 1.0) {
+        prof.cpu_gemv_effective_gbps = med_gemv;
+    } else if (med_read > 1.0) {
+        prof.cpu_gemv_effective_gbps = med_read * 0.50;
     }
 
     if (!optional_nvme_probe_file.empty()) {

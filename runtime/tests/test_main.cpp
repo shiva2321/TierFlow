@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -199,11 +200,9 @@ void test_cache() {
 
 void run_io_backend_tests(tierflow::tf_io_ex* io, const std::string& path,
                           uint64_t file_size, const std::vector<uint8_t>& ground_truth) {
-    const char* name = io->backend_name();
-    std::printf("[TEST] tf_io (%s)...\n", name);
-
     CHECK(!io->open("Z:\\nonexistent_tierflow_dir\\missing_file.bin"), "Non-existent file rejected");
     CHECK(io->open(path.c_str()), "Open temp file");
+    std::printf("[TEST] tf_io (%s)...\n", io->backend_name());
     CHECK(io->file_size() == file_size, "File size matches");
     CHECK(io->alignment() == 4096, "Alignment == 4096");
 
@@ -501,13 +500,19 @@ int main() {
     if (!temp_path.empty()) {
         std::FILE* f = std::fopen(temp_path.c_str(), "rb");
         if (f) {
-            std::fread(truth.data(), 1, truth.size(), f);
+            const size_t nread = std::fread(truth.data(), 1, truth.size(), f);
+            (void)nread;
             std::fclose(f);
         }
     }
 
+#ifdef _WIN32
     auto iocp = tierflow::tf_io_create_iocp();
     run_io_backend_tests(iocp.get(), temp_path, kTestFileSize, truth);
+#else
+    auto linux_io = tierflow::tf_io_create_auto();
+    run_io_backend_tests(linux_io.get(), temp_path, kTestFileSize, truth);
+#endif
 
     std::string ioring_reason;
     if (tierflow::tf_ioring_is_supported(&ioring_reason)) {
@@ -665,6 +670,50 @@ int main() {
                 slot_contents[static_cast<size_t>(r.slot_id)] = obj;
             }
         }
+    }
+
+    {
+        std::printf("[TEST] Phase 10 sliced MoE manifest parsing & medium arena layout...\n");
+        const auto m_path = std::filesystem::temp_directory_path() / "tf_test_moe_v2.json";
+        {
+            std::ofstream ofs(m_path, std::ios::binary | std::ios::trunc);
+            ofs << R"({
+  "format": "TierFlow-TFPack-v2",
+  "tfpack_path": "dummy.tfpack",
+  "slice_moe_experts": true,
+  "gguf_metadata": {
+    "general.architecture": "qwen3moe",
+    "qwen3moe.block_count": 48,
+    "qwen3moe.attention.head_count": 32,
+    "qwen3moe.attention.head_count_kv": 4,
+    "qwen3moe.embedding_length": 2048,
+    "qwen3moe.expert_count": 128,
+    "qwen3moe.expert_used_count": 8
+  },
+  "objects": [
+    {"object_id": 0, "name": "blk.0.ffn_gate_exps.weight#e0", "parent_tensor": "blk.0.ffn_gate_exps.weight", "expert_idx": 0, "n_experts": 128, "role": "moe_experts", "layer": 0, "exact_bytes": 884736, "page_aligned_bytes": 884736, "tfpack_offset": 4096},
+    {"object_id": 1, "name": "blk.0.ffn_down_exps.weight#e7", "parent_tensor": "blk.0.ffn_down_exps.weight", "expert_idx": 7, "n_experts": 128, "role": "moe_experts", "layer": 0, "exact_bytes": 1290240, "page_aligned_bytes": 1290240, "tfpack_offset": 888832}
+  ]
+})";
+        }
+        tierflow::TfManifest mf;
+        std::string err;
+        CHECK(tierflow::load_tf_manifest(m_path.string(), mf, &err), "Parse sliced MoE v2 manifest");
+        std::filesystem::remove(m_path);
+        CHECK(mf.slice_moe_experts, "slice_moe_experts flag parsed");
+        CHECK(mf.expert_count == 128 && mf.expert_used_count == 8, "expert_count and expert_used_count parsed");
+        CHECK(mf.objects.size() == 2, "2 MoE slice objects parsed");
+        CHECK(mf.objects[0].role == tierflow::ObjectRole::EXPERT, "moe_experts role mapped");
+        CHECK(mf.objects[0].parent_tensor == "blk.0.ffn_gate_exps.weight", "parent_tensor preserved");
+        CHECK(mf.objects[1].expert_idx == 7 && mf.objects[1].n_experts == 128, "expert_idx & n_experts preserved");
+
+        std::vector<uint64_t> moe_sizes(384, 1290240ULL);
+        auto moe_plan = tierflow::compute_arena_layout(moe_sizes, 512ULL << 20, 65536ULL, 4);
+        CHECK(moe_plan.feasible, "MoE 512 MiB Class-1 arena feasible");
+        CHECK(moe_plan.classes[0].n_slots == 0 && moe_plan.classes[2].n_slots == 0,
+              "Only Class-1 (512KiB..4MiB) slots allocated for Qwen3-30B-A3B slices");
+        CHECK(moe_plan.classes[1].n_slots > 300, "Hundreds of hot expert slices fit in 512 MiB Class-1 arena");
+        CHECK(moe_plan.total_bytes <= (512ULL << 20), "MoE arena total bytes strictly <= budget");
     }
 
     if (g_failures == 0) {
