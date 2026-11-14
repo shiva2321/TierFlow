@@ -138,7 +138,8 @@ private:
     std::vector<uint64_t> free_ssd_slots_;
     uint64_t next_ssd_slot_ = 0;
 
-    void* spill_handle_ = nullptr; // HANDLE on Windows or int fd wrapper
+    void* spill_handle_ = nullptr; // HANDLE on Windows
+    int   spill_fd_     = -1;      // POSIX file descriptor on Linux
     KvPageStats stats_;
 };
 

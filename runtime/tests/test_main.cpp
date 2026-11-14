@@ -6,6 +6,7 @@
 #include "tf_manifest.h"
 #include "tf_mem_win.h"
 #include "tf_planner.h"
+#include "tf_pool_plan.h"
 #include "tf_prefetch.h"
 #include "tf_probe.h"
 #include "tf_spec.h"
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -198,11 +200,9 @@ void test_cache() {
 
 void run_io_backend_tests(tierflow::tf_io_ex* io, const std::string& path,
                           uint64_t file_size, const std::vector<uint8_t>& ground_truth) {
-    const char* name = io->backend_name();
-    std::printf("[TEST] tf_io (%s)...\n", name);
-
     CHECK(!io->open("Z:\\nonexistent_tierflow_dir\\missing_file.bin"), "Non-existent file rejected");
     CHECK(io->open(path.c_str()), "Open temp file");
+    std::printf("[TEST] tf_io (%s)...\n", io->backend_name());
     CHECK(io->file_size() == file_size, "File size matches");
     CHECK(io->alignment() == 4096, "Alignment == 4096");
 
@@ -500,13 +500,19 @@ int main() {
     if (!temp_path.empty()) {
         std::FILE* f = std::fopen(temp_path.c_str(), "rb");
         if (f) {
-            std::fread(truth.data(), 1, truth.size(), f);
+            const size_t nread = std::fread(truth.data(), 1, truth.size(), f);
+            (void)nread;
             std::fclose(f);
         }
     }
 
+#ifdef _WIN32
     auto iocp = tierflow::tf_io_create_iocp();
     run_io_backend_tests(iocp.get(), temp_path, kTestFileSize, truth);
+#else
+    auto linux_io = tierflow::tf_io_create_auto();
+    run_io_backend_tests(linux_io.get(), temp_path, kTestFileSize, truth);
+#endif
 
     std::string ioring_reason;
     if (tierflow::tf_ioring_is_supported(&ioring_reason)) {
@@ -610,6 +616,104 @@ int main() {
         CHECK(kv_gov.used(tierflow::MemoryTier::RAM) == 0, "KV destructor releases all RAM budget");
         CHECK(kv_gov.used(tierflow::MemoryTier::SSD_SPILL) == 0, "KV destructor releases all SSD spill budget");
         std::filesystem::remove_all(prefix_dir, ec);
+    }
+
+    {
+        std::printf("[TEST] Phase 9 3-size-class arena planner, repin starvation guard, BW EWMA...\n");
+        CHECK(tierflow::assign_size_class(4096) == 0, "4 KiB -> small class 0");
+        CHECK(tierflow::assign_size_class(512ULL << 10) == 0, "512 KiB -> small class 0");
+        CHECK(tierflow::assign_size_class(516ULL << 10) == 1, "516 KiB -> medium class 1");
+        CHECK(tierflow::assign_size_class(4ULL << 20) == 1, "4 MiB -> medium class 1");
+        CHECK(tierflow::assign_size_class((4ULL << 20) + 4096) == 2, ">4 MiB -> large class 2");
+
+        // Verify empty classes allocate 0 slots/bytes, non-empty fit strictly under budget
+        std::vector<uint64_t> sizes{
+            256ULL << 10, 256ULL << 10, 512ULL << 10, 256ULL << 10, // 4 small (stride 512 KiB)
+            3ULL << 20, 3ULL << 20, 4ULL << 20, 3ULL << 20,         // 4 medium (stride 4 MiB)
+        };
+        const uint64_t budget = 64ULL << 20;
+        auto aplan = tierflow::compute_arena_layout(sizes, budget, 16, 4);
+        CHECK(aplan.feasible, "Arena layout feasible within 64 MiB");
+        CHECK(aplan.classes[0].n_slots == 4, "4 small slots match 4 small objects");
+        CHECK(aplan.classes[1].n_slots == 4, "4 medium slots match 4 medium objects");
+        CHECK(aplan.classes[2].n_slots == 0 && aplan.classes[2].total_bytes == 0, "Empty large class allocates 0 bytes");
+        CHECK(aplan.total_bytes <= budget, "Arena total bytes strictly <= budget");
+
+        // Repin tight-slot deadlock guard
+        CHECK(!tierflow::can_repin_slot(8, 0, 2), "Tight 8-slot pool forbids repinning");
+        CHECK(tierflow::can_repin_slot(16, 0, 4), "16-slot pool allows first repin with 11 free slots >= 8");
+        CHECK(!tierflow::can_repin_slot(16, 5, 4), "16-slot pool stops repinning at ratio cap");
+        CHECK(!tierflow::can_repin_slot(16, 4, 8), "16-slot pool stops repinning when remaining < inflight+4");
+
+        // Dynamic prefetch QD & EWMA bandwidth
+        CHECK(tierflow::compute_dynamic_prefetch_cap(2) == 0, "<4 free slots disables prefetch");
+        CHECK(tierflow::compute_dynamic_prefetch_cap(12) == 6, "12 free slots -> QD 6");
+        CHECK(tierflow::compute_dynamic_prefetch_cap(64) == 16, "64 free slots caps QD at 16");
+
+        double bw = tierflow::update_bw_ewma(1.0, 16ULL * 1000 * 1000, 0.004, 0.85); // sample = 4.0 GB/s
+        CHECK(std::abs(bw - 1.45) < 1e-6, "BW EWMA blends 0.85*1.0 + 0.15*4.0 = 1.45 GB/s");
+
+        // Regression test: W-TinyLFU window->probation promotion must never change physical slot bytes
+        tierflow::CacheConfig scfg{};
+        scfg.capacity_slots = 12;
+        scfg.policy = tierflow::CachePolicy::WTinyLFU_SLRU;
+        tierflow::tf_cache scache(scfg);
+        std::vector<uint32_t> slot_contents(12, 0xFFFFFFFFu);
+        for (uint32_t step = 0; step < 300; ++step) {
+            const uint32_t obj = (step < 66) ? (step % 11u) : (step % 19u);
+            auto r = scache.access(obj);
+            CHECK(r.slot_id >= 0 && r.slot_id < 12, "Physical slot bounds valid");
+            if (r.hit) {
+                CHECK(slot_contents[static_cast<size_t>(r.slot_id)] == obj,
+                      "Cache hit returns exact physical slot containing object");
+            } else {
+                slot_contents[static_cast<size_t>(r.slot_id)] = obj;
+            }
+        }
+    }
+
+    {
+        std::printf("[TEST] Phase 10 sliced MoE manifest parsing & medium arena layout...\n");
+        const auto m_path = std::filesystem::temp_directory_path() / "tf_test_moe_v2.json";
+        {
+            std::ofstream ofs(m_path, std::ios::binary | std::ios::trunc);
+            ofs << R"({
+  "format": "TierFlow-TFPack-v2",
+  "tfpack_path": "dummy.tfpack",
+  "slice_moe_experts": true,
+  "gguf_metadata": {
+    "general.architecture": "qwen3moe",
+    "qwen3moe.block_count": 48,
+    "qwen3moe.attention.head_count": 32,
+    "qwen3moe.attention.head_count_kv": 4,
+    "qwen3moe.embedding_length": 2048,
+    "qwen3moe.expert_count": 128,
+    "qwen3moe.expert_used_count": 8
+  },
+  "objects": [
+    {"object_id": 0, "name": "blk.0.ffn_gate_exps.weight#e0", "parent_tensor": "blk.0.ffn_gate_exps.weight", "expert_idx": 0, "n_experts": 128, "role": "moe_experts", "layer": 0, "exact_bytes": 884736, "page_aligned_bytes": 884736, "tfpack_offset": 4096},
+    {"object_id": 1, "name": "blk.0.ffn_down_exps.weight#e7", "parent_tensor": "blk.0.ffn_down_exps.weight", "expert_idx": 7, "n_experts": 128, "role": "moe_experts", "layer": 0, "exact_bytes": 1290240, "page_aligned_bytes": 1290240, "tfpack_offset": 888832}
+  ]
+})";
+        }
+        tierflow::TfManifest mf;
+        std::string err;
+        CHECK(tierflow::load_tf_manifest(m_path.string(), mf, &err), "Parse sliced MoE v2 manifest");
+        std::filesystem::remove(m_path);
+        CHECK(mf.slice_moe_experts, "slice_moe_experts flag parsed");
+        CHECK(mf.expert_count == 128 && mf.expert_used_count == 8, "expert_count and expert_used_count parsed");
+        CHECK(mf.objects.size() == 2, "2 MoE slice objects parsed");
+        CHECK(mf.objects[0].role == tierflow::ObjectRole::EXPERT, "moe_experts role mapped");
+        CHECK(mf.objects[0].parent_tensor == "blk.0.ffn_gate_exps.weight", "parent_tensor preserved");
+        CHECK(mf.objects[1].expert_idx == 7 && mf.objects[1].n_experts == 128, "expert_idx & n_experts preserved");
+
+        std::vector<uint64_t> moe_sizes(384, 1290240ULL);
+        auto moe_plan = tierflow::compute_arena_layout(moe_sizes, 512ULL << 20, 65536ULL, 4);
+        CHECK(moe_plan.feasible, "MoE 512 MiB Class-1 arena feasible");
+        CHECK(moe_plan.classes[0].n_slots == 0 && moe_plan.classes[2].n_slots == 0,
+              "Only Class-1 (512KiB..4MiB) slots allocated for Qwen3-30B-A3B slices");
+        CHECK(moe_plan.classes[1].n_slots > 300, "Hundreds of hot expert slices fit in 512 MiB Class-1 arena");
+        CHECK(moe_plan.total_bytes <= (512ULL << 20), "MoE arena total bytes strictly <= budget");
     }
 
     if (g_failures == 0) {

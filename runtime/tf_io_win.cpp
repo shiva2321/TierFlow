@@ -172,6 +172,27 @@ public:
         return count;
     }
 
+    int wait(tf_read_req* done, int max, uint32_t timeout_ms) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (hfile_ == INVALID_HANDLE_VALUE || max <= 0 || !done) {
+            return 0;
+        }
+
+        drain_completions_locked(0);
+        dispatch_locked();
+        if (ready_done_.empty() && active_inflight_locked() > 0 && timeout_ms > 0) {
+            drain_completions_locked(static_cast<DWORD>(timeout_ms));
+            dispatch_locked();
+        }
+
+        int count = 0;
+        while (count < max && !ready_done_.empty()) {
+            done[count++] = ready_done_.front();
+            ready_done_.pop_front();
+        }
+        return count;
+    }
+
     bool cancel(uint64_t tag) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (hfile_ == INVALID_HANDLE_VALUE) return false;

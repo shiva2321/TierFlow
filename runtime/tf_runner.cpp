@@ -124,6 +124,9 @@ int main(int argc, char** argv) {
         } else if (a == "--gguf") cfg.gguf_path = need("--gguf");
         else if (a == "--manifest") cfg.manifest_path = need("--manifest");
         else if (a == "--ram-budget-mb") cfg.ram_budget_bytes = std::stoull(need("--ram-budget-mb")) << 20;
+        else if (a == "--vram-mb") cfg.vram_budget_bytes = std::stoull(need("--vram-mb")) << 20;
+        else if (a == "--vram-reserve-mib") cfg.vram_reserve_bytes = std::stoull(need("--vram-reserve-mib")) << 20;
+        else if (a == "--n-gpu-layers") cfg.n_gpu_layers = std::stoi(need("--n-gpu-layers"));
         else if (a == "--n-ctx") cfg.n_ctx = static_cast<uint32_t>(std::stoul(need("--n-ctx")));
         else if (a == "--n-batch") cfg.n_batch = static_cast<uint32_t>(std::stoul(need("--n-batch")));
         else if (a == "--n-threads") cfg.n_threads = std::stoi(need("--n-threads"));
@@ -153,6 +156,13 @@ int main(int argc, char** argv) {
             else if (v == "fixed4") cfg.spec_k_mode = tierflow::SpecKMode::Fixed4;
             else if (v == "naive_no_union") cfg.spec_k_mode = tierflow::SpecKMode::NaiveNoUnion;
             else return 2;
+        } else if (a == "--draft-model") cfg.draft_gguf_path = need("--draft-model");
+        else if (a == "--spec-max-k") cfg.spec_max_k = std::max(1, std::stoi(need("--spec-max-k")));
+        else if (a == "--spec-tree") {
+            cfg.spec_tree = (std::stoi(need("--spec-tree")) != 0);
+            if (cfg.spec_tree && cfg.spec_max_k <= 4) {
+                cfg.spec_max_k = 8;
+            }
         } else if (a == "--allow-slow-stream") cfg.allow_slow_stream = (std::stoi(need("--allow-slow-stream")) != 0);
         else if (a == "--no-repack") cfg.no_repack = (std::stoi(need("--no-repack")) != 0);
         else if (a == "--use-ioring") cfg.use_ioring = (std::stoi(need("--use-ioring")) != 0);
@@ -235,12 +245,20 @@ int main(int argc, char** argv) {
 
     std::printf(
         "PLAN model_bytes=%llu ram_weights=%llu slot_bank=%llu kv_reserve=%llu ssd_stream=%llu "
+        "vram_budget=%llu vram_weights=%llu vram_kv=%llu gpu_layers=%d arenas=[%zu,%zu,%zu] "
         "streamed_objs=%zu cache_slots=%zu pred_hit=%.4f pred_tok_s=%.3f pred_tok_s_burst=%.3f load_ms=%.2f\n",
         static_cast<unsigned long long>(init_res.model_total_bytes),
         static_cast<unsigned long long>(init_res.ram_weights_bytes),
         static_cast<unsigned long long>(init_res.ram_slot_bank_bytes),
         static_cast<unsigned long long>(init_res.ram_kv_bytes),
         static_cast<unsigned long long>(init_res.ssd_stream_bytes),
+        static_cast<unsigned long long>(init_res.vram_budget_bytes),
+        static_cast<unsigned long long>(init_res.vram_weights_bytes),
+        static_cast<unsigned long long>(init_res.vram_kv_bytes),
+        init_res.n_gpu_layers_active,
+        init_res.arena_slots[0],
+        init_res.arena_slots[1],
+        init_res.arena_slots[2],
         init_res.n_streamed_tensors,
         init_res.n_cache_slots,
         init_res.predicted_hit_rate,
@@ -295,6 +313,8 @@ int main(int argc, char** argv) {
         js << "\"prefetch_hits\":" << r.prefetch_hits << ",";
         js << "\"prefetch_submitted\":" << r.prefetch_submitted << ",";
         js << "\"prefetch_wasted_bytes\":" << r.prefetch_wasted_bytes << ",";
+        js << "\"eam_prefetch_hits\":" << r.eam_prefetch_hits << ",";
+        js << "\"eam_prefetch_submitted\":" << r.eam_prefetch_submitted << ",";
         js << "\"spec_k_mean\":" << r.spec_k_mean << ",";
         js << "\"spec_accept_rate\":" << r.spec_accept_rate << ",";
         js << "\"prefix_cache_hit\":" << (r.prefix_cache_hit ? "true" : "false") << ",";
@@ -308,6 +328,10 @@ int main(int argc, char** argv) {
         js << "\"peak_gpu_used_bytes\":" << std::max(max_gpu.load(), snap_now.gpu_used_bytes) << ",";
         js << "\"pdh_disk_read_bytes_total\":" << static_cast<uint64_t>(pdh_disk_read_bytes_accum.load()) << ",";
         js << "\"ram_governor_total_bytes\":" << init_res.ram_governor_total_bytes << ",";
+        js << "\"vram_budget_bytes\":" << init_res.vram_budget_bytes << ",";
+        js << "\"vram_governor_total_bytes\":" << init_res.vram_governor_total_bytes << ",";
+        js << "\"n_gpu_layers_active\":" << init_res.n_gpu_layers_active << ",";
+        js << "\"io_bw_ewma_gbps\":" << r.io_bw_ewma_gbps << ",";
         js << "\"ssd_stream_bytes\":" << init_res.ssd_stream_bytes << ",";
         js << "\"n_cache_slots\":" << init_res.n_cache_slots << ",";
         js << "\"generated_tokens\":[";

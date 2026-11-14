@@ -60,6 +60,10 @@ public:
     virtual tf_io_stats stats() const = 0;
     virtual const char* backend_name() const = 0;
     virtual void        drain() = 0;
+    virtual int         wait(tf_read_req* done, int max, uint32_t timeout_ms) {
+        (void)timeout_ms;
+        return poll(done, max);
+    }
 };
 
 // Aligned host buffer allocation (VirtualAlloc on Windows, aligned_alloc/posix_memalign on Linux)

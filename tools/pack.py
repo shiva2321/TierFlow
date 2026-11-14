@@ -210,59 +210,101 @@ def pack_gguf_to_tfpack(
     input_gguf: str,
     out_dir: str,
     verify_roundtrip: bool = True,
+    slice_moe_experts: bool = False,
 ) -> Dict[str, Any]:
     """Pack a GGUF file into a 4096-byte page-aligned `.tfpack` container and `manifest.json`,
-    and optionally verify byte-for-byte identity of every unpacked tensor.
+    and optionally verify byte-for-byte identity of every unpacked tensor (or per-expert slice).
     """
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.perf_counter()
     parsed = parse_gguf_header(input_gguf)
     basename = os.path.splitext(os.path.basename(input_gguf))[0]
-    tfpack_path = os.path.join(out_dir, f"{basename}.tfpack")
-    manifest_path = os.path.join(out_dir, f"{basename}.manifest.json")
+    suffix_tag = ".moe" if slice_moe_experts else ""
+    tfpack_path = os.path.join(out_dir, f"{basename}{suffix_tag}.tfpack")
+    manifest_path = os.path.join(out_dir, f"{basename}{suffix_tag}.manifest.json")
 
     objects: List[Dict[str, Any]] = []
     cur_offset = 0
+    next_obj_id = 0
+
+    def _write_aligned_chunk(raw: bytes) -> Tuple[int, int]:
+        nonlocal cur_offset
+        aligned_offset = align_up(cur_offset, PAGE_SIZE)
+        if aligned_offset > cur_offset:
+            fout.write(b"\x00" * (aligned_offset - cur_offset))
+            cur_offset = aligned_offset
+        fout.write(raw)
+        cur_offset += len(raw)
+        padded_end = align_up(cur_offset, PAGE_SIZE)
+        if padded_end > cur_offset:
+            fout.write(b"\x00" * (padded_end - cur_offset))
+            cur_offset = padded_end
+        return aligned_offset, padded_end - aligned_offset
 
     with open(input_gguf, "rb") as fin, open(tfpack_path, "wb") as fout:
         for t in parsed["tensors"]:
-            fin.seek(t["file_offset"])
-            raw = fin.read(t["n_bytes"])
-            if len(raw) != t["n_bytes"]:
-                raise IOError(f"Short read on tensor {t['name']}")
-
-            sha256_hex = hashlib.sha256(raw).hexdigest()
-            aligned_offset = align_up(cur_offset, PAGE_SIZE)
-            if aligned_offset > cur_offset:
-                fout.write(b"\x00" * (aligned_offset - cur_offset))
-                cur_offset = aligned_offset
-
-            fout.write(raw)
-            cur_offset += len(raw)
-            # Pad the end of every object to a 4096-byte page boundary so
-            # FILE_FLAG_NO_BUFFERING can read `padded_bytes` directly!
-            padded_end = align_up(cur_offset, PAGE_SIZE)
-            if padded_end > cur_offset:
-                fout.write(b"\x00" * (padded_end - cur_offset))
-                cur_offset = padded_end
-
             role, layer_idx = classify_tensor_object(t["name"])
-            objects.append(
-                {
-                    "object_id": t["tensor_id"],
-                    "name": t["name"],
-                    "role": role,
-                    "layer": layer_idx,
-                    "dims": t["dims"],
-                    "ggml_type": t["ggml_type"],
-                    "ggml_type_name": t["ggml_type_name"],
-                    "source_gguf_offset": t["file_offset"],
-                    "tfpack_offset": aligned_offset,
-                    "exact_bytes": t["n_bytes"],
-                    "page_aligned_bytes": padded_end - aligned_offset,
-                    "sha256": sha256_hex,
-                }
+            can_slice = (
+                slice_moe_experts
+                and role == "moe_experts"
+                and len(t["dims"]) == 3
+                and t["dims"][2] > 1
+                and (t["n_bytes"] % t["dims"][2] == 0)
             )
+            fin.seek(t["file_offset"])
+            if can_slice:
+                n_experts = int(t["dims"][2])
+                slice_bytes = t["n_bytes"] // n_experts
+                slice_dims = [int(t["dims"][0]), int(t["dims"][1]), 1]
+                for exp_idx in range(n_experts):
+                    raw = fin.read(slice_bytes)
+                    if len(raw) != slice_bytes:
+                        raise IOError(f"Short read on tensor {t['name']} expert {exp_idx}")
+                    sha256_hex = hashlib.sha256(raw).hexdigest()
+                    aligned_offset, aligned_len = _write_aligned_chunk(raw)
+                    objects.append(
+                        {
+                            "object_id": next_obj_id,
+                            "name": f"{t['name']}#exp{exp_idx}",
+                            "parent_tensor": t["name"],
+                            "role": "moe_expert",
+                            "layer": layer_idx,
+                            "expert_idx": exp_idx,
+                            "n_experts": n_experts,
+                            "dims": slice_dims,
+                            "ggml_type": t["ggml_type"],
+                            "ggml_type_name": t["ggml_type_name"],
+                            "source_gguf_offset": t["file_offset"] + exp_idx * slice_bytes,
+                            "tfpack_offset": aligned_offset,
+                            "exact_bytes": slice_bytes,
+                            "page_aligned_bytes": aligned_len,
+                            "sha256": sha256_hex,
+                        }
+                    )
+                    next_obj_id += 1
+            else:
+                raw = fin.read(t["n_bytes"])
+                if len(raw) != t["n_bytes"]:
+                    raise IOError(f"Short read on tensor {t['name']}")
+                sha256_hex = hashlib.sha256(raw).hexdigest()
+                aligned_offset, aligned_len = _write_aligned_chunk(raw)
+                objects.append(
+                    {
+                        "object_id": next_obj_id,
+                        "name": t["name"],
+                        "role": role,
+                        "layer": layer_idx,
+                        "dims": t["dims"],
+                        "ggml_type": t["ggml_type"],
+                        "ggml_type_name": t["ggml_type_name"],
+                        "source_gguf_offset": t["file_offset"],
+                        "tfpack_offset": aligned_offset,
+                        "exact_bytes": t["n_bytes"],
+                        "page_aligned_bytes": aligned_len,
+                        "sha256": sha256_hex,
+                    }
+                )
+                next_obj_id += 1
         fout.flush()
         os.fsync(fout.fileno())
 
@@ -331,7 +373,8 @@ def pack_gguf_to_tfpack(
     verify_elapsed = time.perf_counter() - verify_t0
 
     manifest = {
-        "format": "TierFlow-TFPack-v1",
+        "format": "TierFlow-TFPack-v2" if slice_moe_experts else "TierFlow-TFPack-v1",
+        "slice_moe_experts": slice_moe_experts,
         "source_gguf": os.path.abspath(input_gguf),
         "source_gguf_size_bytes": os.path.getsize(input_gguf),
         "tfpack_path": os.path.abspath(tfpack_path),
@@ -352,17 +395,18 @@ def pack_gguf_to_tfpack(
 
 
 def selftest() -> None:
-    """Create a synthetic miniature GGUF v3 file with 3 tensors of irregular sizes,
-    pack it to `.tfpack`, and verify 100% byte-identical roundtrip and 4096-byte alignment.
+    """Create a synthetic miniature GGUF v3 file with dense + 3D MoE expert tensors,
+    pack it both whole and with `--slice-moe-experts`, and verify 100% byte-identical
+    roundtrip and 4096-byte alignment.
     """
     tmp_dir = tempfile.mkdtemp(prefix="tfpack_test_")
     gguf_file = os.path.join(tmp_dir, "mini.gguf")
     try:
-        # Build minimal GGUF v3 header with 1 KV ("general.architecture" = "llama") and 3 F32 tensors
         t_specs = [
             ("token_embd.weight", [16, 8], os.urandom(16 * 8 * 4)),
             ("blk.0.attn_q.weight", [8, 8], os.urandom(8 * 8 * 4)),
             ("blk.0.ffn_gate_inp.weight", [4, 8], os.urandom(4 * 8 * 4)),
+            ("blk.0.ffn_gate_exps.weight", [8, 4, 3], os.urandom(8 * 4 * 3 * 4)),
         ]
         with open(gguf_file, "wb") as f:
             f.write(b"GGUF")
@@ -396,10 +440,22 @@ def selftest() -> None:
                     f.write(b"\x00" * (next_cur - cur))
                     cur = next_cur
 
-        manifest = pack_gguf_to_tfpack(gguf_file, tmp_dir, verify_roundtrip=True)
-        assert manifest["verified_byte_identical_objects"] == 3
+        manifest = pack_gguf_to_tfpack(gguf_file, tmp_dir, verify_roundtrip=True, slice_moe_experts=False)
+        assert manifest["verified_byte_identical_objects"] == 4
         assert manifest["unbuffered_single_object_read_verified"] is True
         for obj in manifest["objects"]:
+            assert obj["tfpack_offset"] % PAGE_SIZE == 0
+            assert obj["page_aligned_bytes"] % PAGE_SIZE == 0
+
+        manifest_moe = pack_gguf_to_tfpack(gguf_file, tmp_dir, verify_roundtrip=True, slice_moe_experts=True)
+        assert manifest_moe["num_objects"] == 6
+        assert manifest_moe["verified_byte_identical_objects"] == 6
+        assert manifest_moe["unbuffered_single_object_read_verified"] is True
+        moe_slices = [o for o in manifest_moe["objects"] if o.get("role") == "moe_expert"]
+        assert len(moe_slices) == 3
+        assert [o["expert_idx"] for o in moe_slices] == [0, 1, 2]
+        assert all(o.get("parent_tensor") == "blk.0.ffn_gate_exps.weight" for o in moe_slices)
+        for obj in manifest_moe["objects"]:
             assert obj["tfpack_offset"] % PAGE_SIZE == 0
             assert obj["page_aligned_bytes"] % PAGE_SIZE == 0
         print(
@@ -407,8 +463,9 @@ def selftest() -> None:
             json.dumps(
                 {
                     "num_objects": manifest["num_objects"],
-                    "verified_byte_identical_objects": manifest["verified_byte_identical_objects"],
-                    "unbuffered_single_object_read_verified": manifest["unbuffered_single_object_read_verified"],
+                    "moe_sliced_objects": manifest_moe["num_objects"],
+                    "verified_byte_identical_objects": manifest_moe["verified_byte_identical_objects"],
+                    "unbuffered_single_object_read_verified": manifest_moe["unbuffered_single_object_read_verified"],
                 },
                 indent=2,
             ),
@@ -424,12 +481,18 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, default="")
     parser.add_argument("--out-dir", type=str, default="")
     parser.add_argument("--verify", action="store_true", default=True)
+    parser.add_argument("--slice-moe-experts", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         selftest()
     elif args.input and args.out_dir:
         selftest()
-        m = pack_gguf_to_tfpack(args.input, args.out_dir, verify_roundtrip=args.verify)
+        m = pack_gguf_to_tfpack(
+            args.input,
+            args.out_dir,
+            verify_roundtrip=args.verify,
+            slice_moe_experts=args.slice_moe_experts,
+        )
         summary = {k: v for k, v in m.items() if k not in ("objects", "gguf_metadata")}
         print("Packing complete:", json.dumps(summary, indent=2))
     else:

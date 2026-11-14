@@ -151,6 +151,8 @@ def summarize_condition(name: str, rows: List[Dict[str, Any]], plan_line: str, c
     pref_sub = sum(int(r["prefetch_submitted"]) for r in rows)
     pref_hits = sum(int(r["prefetch_hits"]) for r in rows)
     pref_waste = sum(int(r["prefetch_wasted_bytes"]) for r in rows)
+    eam_sub = sum(int(r.get("eam_prefetch_submitted", 0)) for r in rows)
+    eam_hits = sum(int(r.get("eam_prefetch_hits", 0)) for r in rows)
     ssd_total = sum(int(r["bytes_read_ssd"]) for r in rows)
     last = rows[-1] if rows else {}
     return {
@@ -170,6 +172,9 @@ def summarize_condition(name: str, rows: List[Dict[str, Any]], plan_line: str, c
         "prefetch_hits_total": pref_hits,
         "prefetch_accuracy": (pref_hits / pref_sub) if pref_sub > 0 else None,
         "prefetch_wasted_bytes_total": pref_waste,
+        "eam_prefetch_submitted_total": eam_sub,
+        "eam_prefetch_hits_total": eam_hits,
+        "eam_prefetch_accuracy": (eam_hits / eam_sub) if eam_sub > 0 else None,
         "bytes_read_ssd_total": ssd_total,
         "pdh_disk_read_bytes_total": max((int(r.get("pdh_disk_read_bytes_total", 0)) for r in rows), default=0),
         "peak_process_private_bytes": max((int(r["peak_process_private_bytes"]) for r in rows), default=0),
@@ -180,6 +185,11 @@ def summarize_condition(name: str, rows: List[Dict[str, Any]], plan_line: str, c
         "peak_standby_delta_bytes": max((int(r.get("peak_standby_delta_bytes", 0)) for r in rows), default=0),
         "end_standby_delta_bytes": int(last.get("end_standby_delta_bytes", 0)),
         "ram_governor_total_bytes": int(last.get("ram_governor_total_bytes", 0)),
+        "vram_budget_bytes": int(last.get("vram_budget_bytes", 0)),
+        "vram_governor_total_bytes": int(last.get("vram_governor_total_bytes", 0)),
+        "peak_gpu_used_bytes": max((int(r.get("peak_gpu_used_bytes", 0)) for r in rows), default=0),
+        "n_gpu_layers_active": int(last.get("n_gpu_layers_active", 0)),
+        "io_bw_ewma_gbps": float(last.get("io_bw_ewma_gbps", 0.0)),
         "ssd_stream_bytes": int(last.get("ssd_stream_bytes", 0)),
         "n_cache_slots": int(last.get("n_cache_slots", 0)),
     }
@@ -663,9 +673,309 @@ def run_p8() -> None:
     })
 
 
+# ---------------------------------------------------------------------------
+# Phase 9: Vulkan Hybrid Tiering + 3-Size-Class Arena Pool
+# ---------------------------------------------------------------------------
+def run_p9() -> None:
+    out_dir = os.path.join(REPO_ROOT, "results", "p9_vulkan_pool")
+    base_common = [
+        "--gguf", GGUF_PATH,
+        "--n-ctx", "2048",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "64",
+        "--prompts-file", PROMPTS_20_PATH,
+    ]
+    a_cpu = ["--mode", "stock_mmap", "--n-gpu-layers", "0"] + base_common
+    a_vk = ["--mode", "stock_mmap", "--n-gpu-layers", "99"] + base_common
+    a_hyb9 = ["--mode", "stock_mmap", "--n-gpu-layers", "9"] + base_common
+    a_tf_full = ["--mode", "tierflow", "--manifest", MANIFEST_PATH, "--vram-mb", "2048", "--n-gpu-layers", "99"] + base_common
+    a_tf_split = [
+        "--mode", "tierflow", "--manifest", MANIFEST_PATH,
+        "--vram-mb", "512", "--ram-budget-mb", "512", "--n-gpu-layers", "99",
+        "--allow-slow-stream", "1",
+    ] + base_common
+
+    pl_cpu, r_cpu, dt_cpu = run_tf(a_cpu, os.path.join(out_dir, "stock_mmap_cpu.jsonl"))
+    pl_vk, r_vk, dt_vk = run_tf(a_vk, os.path.join(out_dir, "stock_mmap_vulkan.jsonl"))
+    pl_hyb9, r_hyb9, dt_hyb9 = run_tf(a_hyb9, os.path.join(out_dir, "stock_mmap_hybrid9.jsonl"))
+    pl_full, r_full, dt_full = run_tf(a_tf_full, os.path.join(out_dir, "tierflow_vulkan_full.jsonl"))
+    pl_split, r_split, dt_split = run_tf(a_tf_split, os.path.join(out_dir, "tierflow_hybrid_512_512.jsonl"))
+
+    split_plan = parse_plan_line(pl_split)
+    slot_bank_b = int(split_plan.get("slot_bank", 0))
+    n_slots = int(split_plan.get("cache_slots", 0))
+    max_stride_b = int(r_split[-1].get("slot_stride_bytes", 0)) if r_split else 0
+    if max_stride_b == 0:
+        # Derive largest class stride directly from manifest (ffn_down page-aligned size)
+        with open(MANIFEST_PATH, "r", encoding="utf-8") as mf:
+            man = json.load(mf)
+        max_stride_b = max((int(o["page_aligned_bytes"]) for o in man.get("objects", [])), default=0)
+    uniform_equiv_b = n_slots * max_stride_b
+
+    write_summary(out_dir, {
+        "exp_id": "p9_vulkan_pool",
+        "conditions": {
+            "stock_mmap_cpu": summarize_condition("stock_mmap_cpu", r_cpu, pl_cpu, a_cpu, dt_cpu),
+            "stock_mmap_vulkan": summarize_condition("stock_mmap_vulkan", r_vk, pl_vk, a_vk, dt_vk),
+            "stock_mmap_hybrid9": summarize_condition("stock_mmap_hybrid9", r_hyb9, pl_hyb9, a_hyb9, dt_hyb9),
+            "tierflow_vulkan_full": summarize_condition("tierflow_vulkan_full", r_full, pl_full, a_tf_full, dt_full),
+            "tierflow_hybrid_512_512": summarize_condition("tierflow_hybrid_512_512", r_split, pl_split, a_tf_split, dt_split),
+        },
+        "exactness": {
+            "tierflow_vulkan_full_vs_stock_mmap_vulkan": compare_vs_ref(r_full, r_vk),
+            "tierflow_vulkan_full_vs_stock_mmap_cpu": compare_vs_ref(r_full, r_cpu),
+            "tierflow_hybrid_512_512_vs_stock_mmap_hybrid9": compare_vs_ref(r_split, r_hyb9),
+            "tierflow_hybrid_512_512_vs_stock_mmap_vulkan": compare_vs_ref(r_split, r_vk),
+            "tierflow_hybrid_512_512_vs_stock_mmap_cpu": compare_vs_ref(r_split, r_cpu),
+            "stock_mmap_vulkan_vs_stock_mmap_cpu": compare_vs_ref(r_vk, r_cpu),
+        },
+        "arena_efficiency": {
+            "n_cache_slots": n_slots,
+            "class_arena_slot_bank_bytes": slot_bank_b,
+            "uniform_stride_equiv_bytes": uniform_equiv_b,
+            "memory_reduction_ratio": (uniform_equiv_b / slot_bank_b) if slot_bank_b > 0 else None,
+        },
+    })
+
+
+def run_heat_soak(target_tfpack: str, seconds: int, out_dir: str) -> Dict[str, Any]:
+    bench_exe = os.path.join(REPO_ROOT, "runtime", "build", "tf_io_bench.exe")
+    log_path = os.path.join(out_dir, "heat_soak_log.json")
+    cmd = [
+        bench_exe,
+        "--heat-soak-only",
+        "--file", target_tfpack,
+        "--seconds", str(seconds),
+        "--out", log_path,
+    ]
+    print(f"[RUN] {' '.join(cmd)}")
+    t0 = time.perf_counter()
+    p = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+    dt = time.perf_counter() - t0
+    print(p.stdout.strip())
+    return {"target": target_tfpack, "seconds": seconds, "elapsed_sec": dt, "stdout": p.stdout.strip()}
+
+
+def run_p10() -> None:
+    out_dir = os.path.join(REPO_ROOT, "results", "p10_moe_stream")
+    os.makedirs(out_dir, exist_ok=True)
+
+    olmoe_gguf = r"E:\AI_Research\sophia\models\OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf"
+    olmoe_manifest = os.path.join(REPO_ROOT, "packed_models", "OLMoE-1B-7B-0125-Instruct-Q4_K_M.moe.manifest.json")
+    olmoe_tfpack = os.path.join(REPO_ROOT, "packed_models", "OLMoE-1B-7B-0125-Instruct-Q4_K_M.moe.tfpack")
+
+    qwen_gguf = r"E:\AI_Research\sophia\models\Qwen3-30B-A3B-Q4_K_M.gguf"
+    qwen_manifest = os.path.join(REPO_ROOT, "packed_models", "Qwen3-30B-A3B-Q4_K_M.moe.manifest.json")
+
+    soak_res = run_heat_soak(olmoe_tfpack, 60, out_dir)
+
+    olmoe_common = [
+        "--gguf", olmoe_gguf,
+        "--n-ctx", "1024",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "32",
+        "--prompts-file", PROMPTS_20_PATH,
+    ]
+    a_olmoe_cpu_ref = ["--mode", "stock_mmap", "--n-gpu-layers", "0"] + olmoe_common
+    a_olmoe_cpu_tf = ["--mode", "tierflow", "--manifest", olmoe_manifest, "--n-gpu-layers", "0",
+                      "--vram-mb", "0", "--ram-budget-mb", "1536", "--prefetch", "lookahead", "--repin", "1"] + olmoe_common
+    a_olmoe_vk = ["--mode", "stock_mmap", "--n-gpu-layers", "99"] + olmoe_common
+    a_olmoe_la = ["--mode", "tierflow", "--manifest", olmoe_manifest, "--n-gpu-layers", "99",
+                  "--vram-mb", "768", "--ram-budget-mb", "1152", "--prefetch", "lookahead", "--repin", "1"] + olmoe_common
+    a_olmoe_off = ["--mode", "tierflow", "--manifest", olmoe_manifest, "--n-gpu-layers", "99",
+                   "--vram-mb", "768", "--ram-budget-mb", "1152", "--prefetch", "off", "--repin", "1"] + olmoe_common
+    a_olmoe_shuf = ["--mode", "tierflow", "--manifest", olmoe_manifest, "--n-gpu-layers", "99",
+                    "--vram-mb", "768", "--ram-budget-mb", "1152", "--prefetch", "shuffled", "--repin", "1"] + olmoe_common
+
+    pl_olmoe_cpu_ref, r_olmoe_cpu_ref, dt_olmoe_cpu_ref = run_tf(a_olmoe_cpu_ref, os.path.join(out_dir, "olmoe_stock_mmap_cpu.jsonl"))
+    pl_olmoe_cpu_tf, r_olmoe_cpu_tf, dt_olmoe_cpu_tf = run_tf(a_olmoe_cpu_tf, os.path.join(out_dir, "olmoe_tierflow_cpu.jsonl"))
+    pl_olmoe_vk, r_olmoe_vk, dt_olmoe_vk = run_tf(a_olmoe_vk, os.path.join(out_dir, "olmoe_stock_mmap_vulkan.jsonl"))
+    pl_olmoe_la, r_olmoe_la, dt_olmoe_la = run_tf(a_olmoe_la, os.path.join(out_dir, "olmoe_tierflow_lookahead.jsonl"))
+    pl_olmoe_off, r_olmoe_off, dt_olmoe_off = run_tf(a_olmoe_off, os.path.join(out_dir, "olmoe_tierflow_off.jsonl"))
+    pl_olmoe_shuf, r_olmoe_shuf, dt_olmoe_shuf = run_tf(a_olmoe_shuf, os.path.join(out_dir, "olmoe_tierflow_shuffled.jsonl"))
+
+    qwen_common = [
+        "--gguf", qwen_gguf,
+        "--n-ctx", "1024",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "32",
+        "--prompts-file", PROMPTS_20_PATH,
+    ]
+    a_qwen_vk = ["--mode", "stock_mmap", "--n-gpu-layers", "24"] + qwen_common
+    a_qwen_la = ["--mode", "tierflow", "--manifest", qwen_manifest, "--n-gpu-layers", "99",
+                 "--vram-mb", "2048", "--ram-budget-mb", "6144", "--prefetch", "lookahead", "--repin", "1"] + qwen_common
+    a_qwen_off = ["--mode", "tierflow", "--manifest", qwen_manifest, "--n-gpu-layers", "99",
+                  "--vram-mb", "2048", "--ram-budget-mb", "6144", "--prefetch", "off", "--repin", "1"] + qwen_common
+    a_qwen_shuf = ["--mode", "tierflow", "--manifest", qwen_manifest, "--n-gpu-layers", "99",
+                   "--vram-mb", "2048", "--ram-budget-mb", "6144", "--prefetch", "shuffled", "--repin", "1"] + qwen_common
+
+    pl_qwen_vk, r_qwen_vk, dt_qwen_vk = run_tf(a_qwen_vk, os.path.join(out_dir, "qwen3_30b_stock_mmap_vulkan24.jsonl"))
+    pl_qwen_la, r_qwen_la, dt_qwen_la = run_tf(a_qwen_la, os.path.join(out_dir, "qwen3_30b_tierflow_lookahead.jsonl"))
+    pl_qwen_off, r_qwen_off, dt_qwen_off = run_tf(a_qwen_off, os.path.join(out_dir, "qwen3_30b_tierflow_off.jsonl"))
+    pl_qwen_shuf, r_qwen_shuf, dt_qwen_shuf = run_tf(a_qwen_shuf, os.path.join(out_dir, "qwen3_30b_tierflow_shuffled.jsonl"))
+
+    write_summary(out_dir, {
+        "exp_id": "p10_moe_stream",
+        "heat_soak": soak_res,
+        "conditions": {
+            "olmoe_stock_mmap_cpu": summarize_condition("olmoe_stock_mmap_cpu", r_olmoe_cpu_ref, pl_olmoe_cpu_ref, a_olmoe_cpu_ref, dt_olmoe_cpu_ref),
+            "olmoe_tierflow_cpu": summarize_condition("olmoe_tierflow_cpu", r_olmoe_cpu_tf, pl_olmoe_cpu_tf, a_olmoe_cpu_tf, dt_olmoe_cpu_tf),
+            "olmoe_stock_mmap_vulkan": summarize_condition("olmoe_stock_mmap_vulkan", r_olmoe_vk, pl_olmoe_vk, a_olmoe_vk, dt_olmoe_vk),
+            "olmoe_tierflow_lookahead": summarize_condition("olmoe_tierflow_lookahead", r_olmoe_la, pl_olmoe_la, a_olmoe_la, dt_olmoe_la),
+            "olmoe_tierflow_off": summarize_condition("olmoe_tierflow_off", r_olmoe_off, pl_olmoe_off, a_olmoe_off, dt_olmoe_off),
+            "olmoe_tierflow_shuffled": summarize_condition("olmoe_tierflow_shuffled", r_olmoe_shuf, pl_olmoe_shuf, a_olmoe_shuf, dt_olmoe_shuf),
+            "qwen3_30b_stock_mmap_vulkan24": summarize_condition("qwen3_30b_stock_mmap_vulkan24", r_qwen_vk, pl_qwen_vk, a_qwen_vk, dt_qwen_vk),
+            "qwen3_30b_tierflow_lookahead": summarize_condition("qwen3_30b_tierflow_lookahead", r_qwen_la, pl_qwen_la, a_qwen_la, dt_qwen_la),
+            "qwen3_30b_tierflow_off": summarize_condition("qwen3_30b_tierflow_off", r_qwen_off, pl_qwen_off, a_qwen_off, dt_qwen_off),
+            "qwen3_30b_tierflow_shuffled": summarize_condition("qwen3_30b_tierflow_shuffled", r_qwen_shuf, pl_qwen_shuf, a_qwen_shuf, dt_qwen_shuf),
+        },
+        "exactness": {
+            "olmoe_cpu_vs_stock_cpu": compare_vs_ref(r_olmoe_cpu_tf, r_olmoe_cpu_ref),
+            "olmoe_lookahead_vs_stock_vulkan": compare_vs_ref(r_olmoe_la, r_olmoe_vk),
+            "olmoe_off_vs_stock_vulkan": compare_vs_ref(r_olmoe_off, r_olmoe_vk),
+            "olmoe_shuffled_vs_stock_vulkan": compare_vs_ref(r_olmoe_shuf, r_olmoe_vk),
+            "qwen3_30b_lookahead_vs_stock_vulkan24": compare_vs_ref(r_qwen_la, r_qwen_vk),
+            "qwen3_30b_off_vs_stock_vulkan24": compare_vs_ref(r_qwen_off, r_qwen_vk),
+            "qwen3_30b_shuffled_vs_stock_vulkan24": compare_vs_ref(r_qwen_shuf, r_qwen_vk),
+        },
+    })
+
+
+def run_p11() -> None:
+    out_dir = os.path.join(REPO_ROOT, "results", "p11_draft_moe")
+    os.makedirs(out_dir, exist_ok=True)
+
+    qwen_gguf = r"E:\AI_Research\sophia\models\Qwen3-30B-A3B-Q4_K_M.gguf"
+    qwen_manifest = os.path.join(REPO_ROOT, "packed_models", "Qwen3-30B-A3B-Q4_K_M.moe.manifest.json")
+    qwen_tfpack = os.path.join(REPO_ROOT, "packed_models", "Qwen3-30B-A3B-Q4_K_M.moe.tfpack")
+    draft_gguf = r"E:\AI_Research\sophia\models\Qwen3-0.6B-Q4_K_M.gguf"
+
+    soak_target = qwen_tfpack if os.path.exists(qwen_tfpack) else os.path.join(
+        REPO_ROOT, "packed_models", "OLMoE-1B-7B-0125-Instruct-Q4_K_M.moe.tfpack"
+    )
+    soak_res = run_heat_soak(soak_target, 60, out_dir)
+
+    cpu_common = [
+        "--mode", "tierflow",
+        "--gguf", qwen_gguf,
+        "--manifest", qwen_manifest,
+        "--n-gpu-layers", "0",
+        "--vram-mb", "0",
+        "--ram-budget-mb", "12288",
+        "--n-ctx", "1024",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "16",
+        "--prompts-file", PROMPTS_20_PATH,
+    ]
+    a_cpu_off = ["--spec", "off"] + cpu_common
+    a_cpu_k4 = ["--draft-model", draft_gguf, "--spec", "fixed4", "--spec-max-k", "4"] + cpu_common
+    pl_co, r_co, dt_co = run_tf(a_cpu_off, os.path.join(out_dir, "qwen3_30b_cpu_off_ref.jsonl"))
+    pl_ck, r_ck, dt_ck = run_tf(a_cpu_k4, os.path.join(out_dir, "qwen3_30b_cpu_draft_k4.jsonl"))
+
+    vk_common = [
+        "--mode", "tierflow",
+        "--gguf", qwen_gguf,
+        "--manifest", qwen_manifest,
+        "--n-gpu-layers", "99",
+        "--vram-mb", "2048",
+        "--ram-budget-mb", "6144",
+        "--n-ctx", "1024",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "32",
+        "--prompts-file", PROMPTS_20_PATH,
+    ]
+    a_vk_off = ["--spec", "off"] + vk_common
+    a_vk_adp = ["--draft-model", draft_gguf, "--spec", "adaptive", "--spec-max-k", "4"] + vk_common
+    a_vk_fx4 = ["--draft-model", draft_gguf, "--spec", "fixed4", "--spec-max-k", "4"] + vk_common
+    a_vk_k8  = ["--draft-model", draft_gguf, "--spec", "fixed4", "--spec-max-k", "8", "--spec-tree", "1"] + vk_common
+
+    pl_vo, r_vo, dt_vo = run_tf(a_vk_off, os.path.join(out_dir, "qwen3_30b_moe_off.jsonl"))
+    pl_va, r_va, dt_va = run_tf(a_vk_adp, os.path.join(out_dir, "qwen3_30b_moe_draft_adaptive.jsonl"))
+    pl_vf, r_vf, dt_vf = run_tf(a_vk_fx4, os.path.join(out_dir, "qwen3_30b_moe_draft_fixed4.jsonl"))
+    pl_vk8, r_vk8, dt_vk8 = run_tf(a_vk_k8, os.path.join(out_dir, "qwen3_30b_moe_spec_tree_k8.jsonl"))
+
+    # Part B: Stochastic distribution test (temp=0.8, 500 draws x 4 tokens = 2,000 tokens per arm)
+    sample_prompt_path = os.path.join(out_dir, "stochastic_prompt.jsonl")
+    with open(sample_prompt_path, "w", encoding="utf-8", newline="\n") as f:
+        p0 = FROZEN_PROMPTS[0]
+        f.write(json.dumps({"id": p0["id"], "split": "spec_stochastic", "prompt": p0["prompt"]}) + "\n")
+
+    stoch_common = [
+        "--mode", "tierflow",
+        "--gguf", qwen_gguf,
+        "--manifest", qwen_manifest,
+        "--n-gpu-layers", "99",
+        "--vram-mb", "2048",
+        "--ram-budget-mb", "6144",
+        "--n-ctx", "1024",
+        "--n-batch", "512",
+        "--n-threads", "6",
+        "--n-predict", "4",
+        "--temp", "0.8",
+        "--repeat", "500",
+        "--prompts-file", sample_prompt_path,
+    ]
+    _, s_off, dt_soff = run_tf(["--spec", "off", "--seed", "10000"] + stoch_common,
+                               os.path.join(out_dir, "stochastic_500x4_off.jsonl"))
+    _, s_fx4, dt_sfx4 = run_tf(["--draft-model", draft_gguf, "--spec", "fixed4", "--spec-max-k", "4",
+                                "--seed", "50000"] + stoch_common,
+                               os.path.join(out_dir, "stochastic_500x4_fixed4.jsonl"))
+
+    c_t1_off = collections.Counter(str(r["generated_tokens"][0]) for r in s_off if len(r["generated_tokens"]) >= 1)
+    c_t1_fx4 = collections.Counter(str(r["generated_tokens"][0]) for r in s_fx4 if len(r["generated_tokens"]) >= 1)
+    c_t2_off = collections.Counter(str(r["generated_tokens"][1]) for r in s_off if len(r["generated_tokens"]) >= 2)
+    c_t2_fx4 = collections.Counter(str(r["generated_tokens"][1]) for r in s_fx4 if len(r["generated_tokens"]) >= 2)
+    c_t3_off = collections.Counter(str(r["generated_tokens"][2]) for r in s_off if len(r["generated_tokens"]) >= 3)
+    c_t3_fx4 = collections.Counter(str(r["generated_tokens"][2]) for r in s_fx4 if len(r["generated_tokens"]) >= 3)
+    c_b12_off = collections.Counter(f"{r['generated_tokens'][0]}_{r['generated_tokens'][1]}" for r in s_off if len(r["generated_tokens"]) >= 2)
+    c_b12_fx4 = collections.Counter(f"{r['generated_tokens'][0]}_{r['generated_tokens'][1]}" for r in s_fx4 if len(r["generated_tokens"]) >= 2)
+    c_b23_off = collections.Counter(f"{r['generated_tokens'][1]}_{r['generated_tokens'][2]}" for r in s_off if len(r["generated_tokens"]) >= 3)
+    c_b23_fx4 = collections.Counter(f"{r['generated_tokens'][1]}_{r['generated_tokens'][2]}" for r in s_fx4 if len(r["generated_tokens"]) >= 3)
+
+    stochastic_res = {
+        "temp": 0.8,
+        "n_trajectories_per_arm": len(s_off),
+        "tokens_per_trajectory": 4,
+        "total_tokens_per_arm": sum(len(r["generated_tokens"]) for r in s_off),
+        "elapsed_sec": {"spec_off": dt_soff, "spec_fixed4": dt_sfx4},
+        "spec_fixed4_accept_rate_mean": sum(float(r["spec_accept_rate"]) for r in s_fx4) / max(1, len(s_fx4)),
+        "spec_fixed4_k_mean": sum(float(r["spec_k_mean"]) for r in s_fx4) / max(1, len(s_fx4)),
+        "first_token_chi2": chi_square_two_sample(c_t1_off, c_t1_fx4),
+        "second_token_chi2": chi_square_two_sample(c_t2_off, c_t2_fx4),
+        "third_token_chi2": chi_square_two_sample(c_t3_off, c_t3_fx4),
+        "bigram_12_chi2": chi_square_two_sample(c_b12_off, c_b12_fx4),
+        "bigram_23_chi2": chi_square_two_sample(c_b23_off, c_b23_fx4),
+    }
+
+    write_summary(out_dir, {
+        "exp_id": "p11_draft_moe",
+        "heat_soak": soak_res,
+        "conditions": {
+            "qwen3_30b_cpu_off_ref": summarize_condition("qwen3_30b_cpu_off_ref", r_co, pl_co, a_cpu_off, dt_co),
+            "qwen3_30b_cpu_draft_k4": summarize_condition("qwen3_30b_cpu_draft_k4", r_ck, pl_ck, a_cpu_k4, dt_ck),
+            "qwen3_30b_moe_off": summarize_condition("qwen3_30b_moe_off", r_vo, pl_vo, a_vk_off, dt_vo),
+            "qwen3_30b_moe_draft_adaptive": summarize_condition("qwen3_30b_moe_draft_adaptive", r_va, pl_va, a_vk_adp, dt_va),
+            "qwen3_30b_moe_draft_fixed4": summarize_condition("qwen3_30b_moe_draft_fixed4", r_vf, pl_vf, a_vk_fx4, dt_vf),
+            "qwen3_30b_moe_spec_tree_k8": summarize_condition("qwen3_30b_moe_spec_tree_k8", r_vk8, pl_vk8, a_vk_k8, dt_vk8),
+        },
+        "exactness": {
+            "cpu_draft_k4_vs_cpu_off": compare_vs_ref(r_ck, r_co),
+            "vulkan_draft_adaptive_vs_vulkan_off": compare_vs_ref(r_va, r_vo),
+            "vulkan_draft_fixed4_vs_vulkan_off": compare_vs_ref(r_vf, r_vo),
+            "vulkan_spec_tree_k8_vs_vulkan_off": compare_vs_ref(r_vk8, r_vo),
+        },
+        "stochastic_500x4": stochastic_res,
+    })
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["export-prompts", "selfcheck", "p3", "p4", "p4_v2", "p5", "p6", "p7", "p8"])
+    ap.add_argument("phase", choices=["export-prompts", "selfcheck", "p3", "p4", "p4_v2", "p5", "p6", "p7", "p8", "p9", "p10", "p11"])
     args = ap.parse_args()
     if args.phase == "export-prompts":
         export_prompts()
@@ -685,6 +995,12 @@ def main() -> None:
         run_p7()
     elif args.phase == "p8":
         run_p8()
+    elif args.phase == "p9":
+        run_p9()
+    elif args.phase == "p10":
+        run_p10()
+    elif args.phase == "p11":
+        run_p11()
 
 
 if __name__ == "__main__":

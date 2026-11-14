@@ -57,19 +57,43 @@ target_link_libraries(tf_io_bench PRIVATE tierflow_core)
 # Link TierFlow live llama.cpp streaming runner if third_party/llama.cpp/build exists
 set(LLAMA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp")
 set(LLAMA_BLD_DIR "${LLAMA_SRC_DIR}/build")
-if(EXISTS "${LLAMA_BLD_DIR}/src/llama.lib")
-    add_executable(tf_runner tf_llama_stream.cpp tf_runner.cpp)
+if(WIN32)
+    set(LLAMA_LIB "${LLAMA_BLD_DIR}/src/llama.lib")
+    set(GGML_LIB "${LLAMA_BLD_DIR}/ggml/src/ggml.lib")
+    set(GGML_CPU_LIB "${LLAMA_BLD_DIR}/ggml/src/ggml-cpu.lib")
+    set(GGML_BASE_LIB "${LLAMA_BLD_DIR}/ggml/src/ggml-base.lib")
+    set(GGML_VK_LIB "${LLAMA_BLD_DIR}/ggml/src/ggml-vulkan/ggml-vulkan.lib")
+else()
+    set(LLAMA_LIB "${LLAMA_BLD_DIR}/src/libllama.a")
+    set(GGML_LIB "${LLAMA_BLD_DIR}/ggml/src/libggml.a")
+    set(GGML_CPU_LIB "${LLAMA_BLD_DIR}/ggml/src/libggml-cpu.a")
+    set(GGML_BASE_LIB "${LLAMA_BLD_DIR}/ggml/src/libggml-base.a")
+    set(GGML_VK_LIB "${LLAMA_BLD_DIR}/ggml/src/ggml-vulkan/libggml-vulkan.a")
+endif()
+
+if(EXISTS "${LLAMA_LIB}")
+    add_executable(tf_runner tf_llama_stream.cpp tf_draft.cpp tf_runner.cpp)
     target_include_directories(tf_runner PRIVATE
         "${LLAMA_SRC_DIR}/include"
         "${LLAMA_SRC_DIR}/ggml/include"
     )
     target_link_libraries(tf_runner PRIVATE
         tierflow_core
-        "${LLAMA_BLD_DIR}/src/llama.lib"
-        "${LLAMA_BLD_DIR}/ggml/src/ggml.lib"
-        "${LLAMA_BLD_DIR}/ggml/src/ggml-cpu.lib"
-        "${LLAMA_BLD_DIR}/ggml/src/ggml-base.lib"
+        "${LLAMA_LIB}"
+        "${GGML_LIB}"
+        "${GGML_CPU_LIB}"
+        "${GGML_BASE_LIB}"
     )
+    if(EXISTS "${GGML_VK_LIB}")
+        find_package(Vulkan QUIET)
+        if(Vulkan_FOUND)
+            target_link_libraries(tf_runner PRIVATE "${GGML_VK_LIB}" Vulkan::Vulkan)
+            target_compile_definitions(tf_runner PRIVATE TF_HAS_VULKAN=1)
+        elseif(WIN32 AND DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/Lib/vulkan-1.lib")
+            target_link_libraries(tf_runner PRIVATE "${GGML_VK_LIB}" "$ENV{VULKAN_SDK}/Lib/vulkan-1.lib")
+            target_compile_definitions(tf_runner PRIVATE TF_HAS_VULKAN=1)
+        endif()
+    endif()
     if(WIN32)
         target_link_libraries(tf_runner PRIVATE user32 advapi32)
     endif()
